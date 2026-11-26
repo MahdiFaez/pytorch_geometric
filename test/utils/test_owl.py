@@ -117,7 +117,7 @@ def test_from_owl():
     assert data.node_iri == [BASE + 'alice', BASE + 'bob', BASE + 'carol']
     assert data.y.tolist() == [0, 1, 1]
 
-    # Relations are sorted by IRI, inverse edges follow `Entities`:
+    # Relations keep their order, inverse edges follow `Entities`:
     assert data.schema.relation_names == [BASE + 'knows', BASE + 'likes']
     assert data.schema.inverse_edge_types
     edges = set(
@@ -126,10 +126,11 @@ def test_from_owl():
     assert edges == {(0, 1, 0), (1, 0, 1), (1, 0, 0), (0, 1, 1), (1, 2, 2),
                      (2, 1, 3), (2, 1, 2), (1, 2, 3)}
 
-    # The target class is never a node feature:
+    # The target class is never a node feature. Columns of the original
+    # feature matrix come first, inferred types follow:
     names = data.schema.feature_names
     assert names == [
-        BASE + 'Person', BASE + 'Role', BASE + 'Student', BASE + 'age'
+        BASE + 'Student', BASE + 'age', BASE + 'Person', BASE + 'Role'
     ]
     assert data.schema.target_classes == [BASE + 'Teacher']
     assert data.x[:, names.index(BASE + 'Student')].tolist() == [1, 0, 1]
@@ -175,3 +176,128 @@ def test_owl_round_trip():
     assert set(map(tuple, out.edge_index[:, forward].t().tolist())) == set(
         map(tuple,
             data.edge_index.t().tolist()))
+
+
+@withPackage('rdflib')
+def test_from_owl_natural_order():
+    data = Data(edge_index=torch.tensor([[0, 11], [11, 0]]), num_nodes=12)
+    graph = to_owl(data, OWLSchema(base_iri=BASE), annotate_order=False)
+
+    out = from_owl(graph)
+    assert out.node_iri == [BASE + f'node_{i}' for i in range(12)]
+
+
+@withPackage('rdflib')
+def test_owl_round_trip_order():
+    # Node names, relation names and feature names that are not sorted:
+    data = get_data()
+    schema = get_schema()
+    schema.node_names = ['carol', 'alice', 'bob']
+    schema.relation_names = ['likes', 'knows']
+    schema.feature_names = ['Teacher', 'Student', 'age']
+
+    out = from_owl(to_owl(data, schema))
+    assert out.node_iri == [BASE + name for name in schema.node_names]
+    assert out.schema.relation_names == [
+        BASE + name for name in schema.relation_names
+    ]
+    assert out.schema.feature_names[:3] == [
+        BASE + name for name in schema.feature_names
+    ]
+    assert torch.equal(out.x[:, :3], data.x)
+
+    forward = out.edge_type % 2 == 0
+    out_edges = torch.cat([out.edge_index, out.edge_type.view(1, -1) // 2])
+    edges = torch.cat([data.edge_index, data.edge_type.view(1, -1)])
+    assert sorted(out_edges[:, forward].t().tolist()) == sorted(
+        edges.t().tolist())
+
+
+@withPackage('rdflib')
+def test_owl_edge_attr():
+    from rdflib import URIRef
+    from rdflib.namespace import RDF
+
+    from torch_geometric.data.owl_data import PYG_EDGE, PYG_HAS_OUTGOING_EDGE
+
+    # A parallel edge (0 -> 1) and edge features (a bond type and a length):
+    edge_index = torch.tensor([[0, 0, 1, 2], [1, 1, 2, 0]])
+    edge_attr = torch.tensor([
+        [1.0, 0.0, 1.5],
+        [0.0, 1.0, 1.2],
+        [1.0, 0.0, 1.4],
+        [0.0, 1.0, 1.3],
+    ])
+    data = Data(edge_index=edge_index, edge_attr=edge_attr, num_nodes=3)
+    schema = OWLSchema(
+        base_iri=BASE, relation_names=['bond'],
+        edge_feature_names=['SingleBond', 'DoubleBond', 'length'])
+
+    graph = to_owl(data, schema)
+    edge = URIRef(BASE + 'edge_1')
+    assert (edge, RDF.type, URIRef(PYG_EDGE)) in graph
+    assert (edge, RDF.type, URIRef(BASE + 'DoubleBond')) in graph
+    assert (URIRef(BASE + 'node_0'), URIRef(PYG_HAS_OUTGOING_EDGE),
+            edge) in graph
+    assert (URIRef(BASE + 'node_0'), URIRef(BASE + 'bond'),
+            URIRef(BASE + 'node_1')) in graph
+
+    out = from_owl(graph, add_inverse_edges=False)
+    assert out.num_nodes == 3  # Edge individuals are no nodes.
+    assert out.x.size(1) == 1  # Only `Node`, no `pyg:Edge` or edge features.
+    assert out.schema.reify_edges
+    assert out.schema.edge_feature_names == [
+        BASE + 'SingleBond', BASE + 'DoubleBond', BASE + 'length'
+    ]
+    assert out.schema.edge_feature_encoding == ['class', 'class', 'numeric']
+    assert torch.equal(out.edge_index, edge_index)
+    assert torch.allclose(out.edge_attr, edge_attr)
+
+    # Inverse edges share the features of their forward edge:
+    out = from_owl(graph)
+    assert out.edge_index.size(1) == 8
+    forward = out.edge_type == 0
+    assert torch.allclose(out.edge_attr[forward], edge_attr)
+    assert torch.allclose(out.edge_attr[~forward].sum(0), edge_attr.sum(0))
+
+    # Converting twice is lossless:
+    out = from_owl(out.to_owl(), add_inverse_edges=False)
+    assert torch.equal(out.edge_index, edge_index)
+    assert torch.allclose(out.edge_attr, edge_attr)
+
+    # Parallel edges are preserved even without edge features:
+    data = Data(edge_index=edge_index, num_nodes=3)
+    out = from_owl(to_owl(data, OWLSchema(base_iri=BASE)),
+                   add_inverse_edges=False)
+    assert torch.equal(out.edge_index, edge_index)
+    assert out.edge_attr is None
+
+    data = Data(edge_index=edge_index[:, 1:], num_nodes=3)
+    graph = to_owl(data, OWLSchema(base_iri=BASE))
+    assert len(list(graph.subjects(RDF.type, URIRef(PYG_EDGE)))) == 0
+
+    with pytest.raises(ValueError, match="one row per edge"):
+        to_owl(
+            Data(edge_index=edge_index, edge_attr=edge_attr[:2], num_nodes=3))
+    with pytest.raises(ValueError, match="edge feature names"):
+        to_owl(Data(edge_index=edge_index, edge_attr=edge_attr, num_nodes=3),
+               OWLSchema(edge_feature_names=['length']))
+
+
+@withPackage('rdflib')
+def test_from_owl_skips_builtin_classes():
+    from rdflib import URIRef
+    from rdflib.namespace import OWL, RDF, RDFS, XSD
+
+    datatype = URIRef(str(OWL) + 'Datatype')  # Used in, *e.g.*, AIFB.
+    graph = to_owl(get_data(), get_schema())
+    graph.add((datatype, RDF.type, RDFS.Class))
+    graph.add((URIRef(BASE + 'myString'), RDF.type, datatype))
+    graph.add((XSD.string, RDF.type, OWL.NamedIndividual))
+    graph.add((URIRef(BASE + 'Role'), RDFS.subClassOf, OWL.Thing))
+
+    out = from_owl(graph)
+    assert out.num_nodes == 3  # Datatypes are no individuals.
+    names = out.schema.feature_names
+    assert str(datatype) not in names
+    assert str(OWL.Thing) not in names

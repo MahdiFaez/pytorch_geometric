@@ -188,3 +188,76 @@ def test_ontolearn_explainer_supports():
                                                        return_type='raw'))
 
     assert str(OntolearnExplainer('celoe')) == 'OntolearnExplainer(CELOE)'
+
+
+class ConstantModel(torch.nn.Module):
+    def forward(self, x, edge_index, **kwargs):
+        return torch.zeros(x.size(0), 2)
+
+
+@withPackage('ontolearn', 'rdflib')
+def test_ontolearn_explainer_edge_attr():
+    # A ring, where only edges from even to odd nodes are double bonds. The
+    # planted concept of class 1 thus is `∃ hasOutgoingEdge.DoubleBond`:
+    num_nodes = 12
+    row = torch.arange(num_nodes)
+    col = (row + 1) % num_nodes
+    edge_index = torch.cat([torch.stack([row, col]),
+                            torch.stack([col, row])], dim=1)
+    double = torch.cat([row % 2 == 0, torch.zeros(num_nodes, dtype=bool)])
+    edge_attr = torch.stack([~double, double], dim=1).float()
+    x = torch.ones(num_nodes, 1)
+    y = (row % 2 == 0).long()
+
+    schema = OWLSchema(base_iri=BASE, relation_names=['bond'],
+                       feature_names=['Atom'],
+                       edge_feature_names=['SingleBond', 'DoubleBond'])
+    algorithm = OntolearnExplainer('EvoLearner', schema=schema, seed=0,
+                                   max_runtime=5)
+    explainer = get_explainer(algorithm, model=ConstantModel())
+    explanation = explainer(x, edge_index, target=y, index=0,
+                            edge_attr=edge_attr)
+    assert explanation.concept_accuracy == 1.0
+    assert explanation.node_mask.view(-1).tolist() == y.float().tolist()
+
+
+@withPackage('ontolearn', 'rdflib')
+def test_ontolearn_explainer_name_collisions():
+    # Two relations and two data properties share their local names, as in
+    # AIFB (`swrc:type` and `merge:type`):
+    data = get_data()
+    data.edge_type = torch.arange(data.edge_index.size(1)) % 2
+    data.x = torch.cat([data.x, torch.rand(data.num_nodes, 2)], dim=1)
+    schema = OWLSchema(
+        base_iri=BASE,
+        relation_names=['http://a.org/x#next', 'http://b.org/y#next'],
+        feature_names=[
+            'Red', 'Blue', 'http://a.org/x#weight', 'http://b.org/y#weight'
+        ],
+        feature_encoding=['class', 'class', 'numeric', 'numeric'],
+    )
+    algorithm = OntolearnExplainer('EvoLearner', schema=schema, seed=0,
+                                   max_runtime=2)
+    explainer = get_explainer(algorithm, model=ConstantModel())
+    explanation = explainer(data.x, data.edge_index, target=data.y, index=0,
+                            edge_type=data.edge_type)
+    assert explanation.concept_accuracy == 1.0
+
+    # Fitting again rebuilds the primitives of EvoLearner:
+    explanation = explainer(data.x, data.edge_index, target=data.y, index=1,
+                            edge_type=data.edge_type)
+    assert explanation.concept_class == 0
+    assert explanation.concept_accuracy == 1.0
+
+    # The patch of DEAP is only active during learning:
+    from deap import gp
+    assert gp.PrimitiveSetTyped.addPrimitive.__module__ == 'deap.gp'
+
+
+@withPackage('ontolearn', 'rdflib')
+def test_ontolearn_explainer_urn_iris():
+    data = get_data()
+    schema = OWLSchema(base_iri='urn:example:graph#')
+    explainer = get_explainer(OntolearnExplainer(schema=schema))
+    with pytest.raises(ValueError, match="contain a '/'"):
+        explainer(data.x, data.edge_index, target=data.y, index=0)

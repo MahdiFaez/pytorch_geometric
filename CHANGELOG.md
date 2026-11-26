@@ -7,7 +7,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ### Added
 
-- Added `torch_geometric.data.OWLData`, `torch_geometric.data.OWLSchema`, `torch_geometric.utils.to_owl` and `torch_geometric.utils.from_owl` to convert between graphs and OWL ontologies
+- Added `torch_geometric.data.OWLData`, `torch_geometric.data.OWLSchema`, `torch_geometric.utils.to_owl` and `torch_geometric.utils.from_owl` to convert between graphs and OWL ontologies, including edge features (via reified edges) and order-preserving round trips
 - Added `torch_geometric.explain.algorithm.OntolearnExplainer` to explain GNNs by OWL class expressions learned by Ontolearn concept learners, plus an example
 - Added `torch_geometric.contrib.nn.models.MGNAN` (M-GNAN, an extension of `GNAN` to multivariate shape functions) model plus an example ([#10371](https://github.com/pyg-team/pytorch_geometric/pull/10371))
 

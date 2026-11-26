@@ -4,7 +4,8 @@ import logging
 import os.path as osp
 import tempfile
 from collections import defaultdict
-from typing import Any, Dict, List, Optional, Sequence, Tuple, Union
+from enum import Enum
+from typing import Any, Dict, Iterator, List, Optional, Sequence, Tuple, Union
 
 import torch
 from torch import Tensor
@@ -18,6 +19,59 @@ from torch_geometric.data.owl_data import (
 from torch_geometric.explain import Explanation
 from torch_geometric.explain.algorithm import ExplainerAlgorithm
 from torch_geometric.explain.config import MaskType, ModelMode, ModelTaskLevel
+
+
+@contextlib.contextmanager
+def _unique_primitive_names() -> Iterator[None]:
+    r"""Makes the names of DEAP primitives and terminals unique while the
+    context is active.
+
+    :class:`ontolearn.concept_learner.EvoLearner` names its DEAP primitives
+    and terminals after the local names of IRIs, and DEAP raises an error if
+    two of them share a name, *e.g.*, if two object properties are called
+    :obj:`next` in different namespaces. The OWL entities themselves are not
+    renamed, so learned class expressions are not affected.
+    """
+    try:
+        from deap import gp
+    except ImportError:  # Learners that are not based on DEAP.
+        yield
+        return
+
+    add_primitive = gp.PrimitiveSetTyped.addPrimitive
+    add_terminal = gp.PrimitiveSetTyped.addTerminal
+
+    def unique(pset: Any, name: str) -> str:
+        candidate, suffix = name, 2
+        while candidate in pset.context:
+            candidate, suffix = f'{name}_{suffix}', suffix + 1
+        return candidate
+
+    def primitive(pset: Any, function: Any, in_types: Any, ret_type: Any,
+                  name: Optional[str] = None) -> None:
+        name = name.value if isinstance(name, Enum) else name
+        if name in pset.context and pset.context[name] is not function:
+            name = unique(pset, name)
+        add_primitive(pset, function, in_types, ret_type, name=name)
+
+    def terminal(pset: Any, value: Any, ret_type: Any,
+                 name: Optional[str] = None) -> None:
+        if name is not None and name in pset.context:
+            if pset.context[name] == value:
+                # Equal literals of data properties with equal local names
+                # can share a name, which EvoLearner relies on when refitting:
+                del pset.context[name]
+            else:
+                name = unique(pset, name)
+        add_terminal(pset, value, ret_type, name=name)
+
+    gp.PrimitiveSetTyped.addPrimitive = primitive  # type: ignore
+    gp.PrimitiveSetTyped.addTerminal = terminal  # type: ignore
+    try:
+        yield
+    finally:
+        gp.PrimitiveSetTyped.addPrimitive = add_primitive  # type: ignore
+        gp.PrimitiveSetTyped.addTerminal = add_terminal  # type: ignore
 
 
 class OntolearnExplainer(ExplainerAlgorithm):
@@ -189,7 +243,8 @@ class OntolearnExplainer(ExplainerAlgorithm):
                              f"of shape {tuple(target.size())})")
         target = target.detach().cpu().long()
 
-        self._prepare_knowledge_base(x, edge_index, kwargs.get('edge_type'))
+        self._prepare_knowledge_base(x, edge_index, kwargs.get('edge_type'),
+                                     kwargs.get('edge_attr'))
         cls = self._get_class(target, index)
         pos, neg = self._get_examples(target, cls)
 
@@ -253,6 +308,7 @@ class OntolearnExplainer(ExplainerAlgorithm):
         x: Tensor,
         edge_index: Tensor,
         edge_type: Optional[Tensor],
+        edge_attr: Optional[Tensor] = None,
     ) -> None:
         r"""Builds (or re-uses) the knowledge base and concept learner."""
         if self.data is not None and self.data.num_nodes != x.size(0):
@@ -279,9 +335,18 @@ class OntolearnExplainer(ExplainerAlgorithm):
         if data is None:
             data = OWLData.from_data(
                 Data(x=x.detach().cpu(), edge_index=edge_index.detach().cpu(),
-                     edge_type=edge_type, num_nodes=x.size(0)),
+                     edge_type=edge_type, edge_attr=edge_attr,
+                     num_nodes=x.size(0)),
                 self.schema,
             )
+
+        # `owlapy` rejects IRIs without a "/", *e.g.*, "urn:" IRIs:
+        invalid = [iri for iri in data.node_iri if '/' not in iri]
+        if len(invalid) > 0:
+            raise ValueError(f"Ontolearn only supports IRIs that contain a "
+                             f"'/' (got '{invalid[0]}'). Use an 'http(s)' "
+                             f"IRI as 'base_iri' of the schema instead.")
+
         path = data.source
         if path is None or not osp.exists(path):
             self._tmp_dir = tempfile.TemporaryDirectory()
@@ -318,9 +383,12 @@ class OntolearnExplainer(ExplainerAlgorithm):
             else:
                 import ontolearn.learners
                 cls = getattr(ontolearn.learners, self.learner)
-            learner = cls(knowledge_base=kb, **self.learner_kwargs)
+            with _unique_primitive_names():
+                learner = cls(knowledge_base=kb, **self.learner_kwargs)
         elif isinstance(self.learner, type):
-            learner = self.learner(knowledge_base=kb, **self.learner_kwargs)
+            with _unique_primitive_names():
+                learner = self.learner(knowledge_base=kb,
+                                       **self.learner_kwargs)
         else:  # An already initialized learner:
             learner = self.learner
             kb = getattr(learner, 'kb', kb)
@@ -405,7 +473,8 @@ class OntolearnExplainer(ExplainerAlgorithm):
             }
 
         problem = PosNegLPStandard(pos=individuals(pos), neg=individuals(neg))
-        with contextlib.redirect_stdout(io.StringIO()):
+        with contextlib.redirect_stdout(io.StringIO()), \
+                _unique_primitive_names():
             self._concept_learner.fit(problem)
             hypotheses = self._concept_learner.best_hypotheses(
                 n=self.num_hypotheses)

@@ -13,6 +13,16 @@ from torch_geometric.utils.mixin import CastMixin
 
 FEATURE_ENCODINGS = {'auto', 'class', 'numeric', 'boolean', 'ignore'}
 
+# The namespace of the structural vocabulary that PyG adds to an ontology:
+# Annotations that preserve the order of nodes, relations and features, and
+# the classes/properties of reified edges (see :meth:`utils.to_owl`).
+PYG_NAMESPACE = 'https://pyg.org/owl#'
+PYG_INDEX = PYG_NAMESPACE + 'index'
+PYG_RELATION = PYG_NAMESPACE + 'relation'
+PYG_EDGE = PYG_NAMESPACE + 'Edge'
+PYG_HAS_OUTGOING_EDGE = PYG_NAMESPACE + 'hasOutgoingEdge'
+PYG_HAS_INCOMING_EDGE = PYG_NAMESPACE + 'hasIncomingEdge'
+
 _ABSOLUTE_IRI = re.compile(r'^[A-Za-z][A-Za-z0-9+.-]*:[^\s]+$')
 
 
@@ -29,6 +39,53 @@ def local_name(iri: str) -> str:
     or :obj:`/`).
     """
     return re.split(r'[#/]', iri.rstrip('#/'))[-1]
+
+
+def natural_key(name: str) -> List[Any]:
+    r"""Returns a sort key that orders numbers in :obj:`name` numerically,
+    *e.g.*, :obj:`"node_2"` before :obj:`"node_10"`.
+    """
+    return [(0, int(part)) if part.isdigit() else (1, part)
+            for part in re.split(r'(\d+)', name)]
+
+
+def _resolve_encoding(
+    spec: Union[str, List[str], Dict[str, str]],
+    names: Optional[List[str]],
+    index: int,
+    column: Optional[Tensor],
+) -> str:
+    encoding = 'auto'
+    if isinstance(spec, str):
+        encoding = spec
+    elif isinstance(spec, list):
+        encoding = spec[index]
+    elif names is not None:
+        encoding = spec.get(names[index], 'auto')
+
+    if encoding == 'auto':
+        is_binary = column is not None and bool(
+            ((column == 0) | (column == 1)).all())
+        return 'class' if is_binary else 'numeric'
+    return encoding
+
+
+def _check_encoding(
+    spec: Union[str, Sequence[str], Dict[str, str]],
+) -> Union[str, List[str], Dict[str, str]]:
+    if isinstance(spec, str):
+        encodings: Iterable[str] = [spec]
+    elif isinstance(spec, dict):
+        spec = dict(spec)
+        encodings = spec.values()
+    else:
+        spec = list(spec)
+        encodings = spec
+    for encoding in encodings:
+        if encoding not in FEATURE_ENCODINGS:
+            raise ValueError(f"Unknown feature encoding '{encoding}' "
+                             f"(expected one of {sorted(FEATURE_ENCODINGS)})")
+    return spec
 
 
 @dataclass(init=False)
@@ -50,6 +107,21 @@ class OWLSchema(CastMixin):
 
     Names can either be local names (which are prefixed with
     :obj:`base_iri`) or absolute IRIs (which are used as they are).
+
+    Edges are written as plain object property assertions. If the graph has
+    edge features :obj:`edge_attr` or parallel edges, every edge is
+    additionally *reified* as an individual of class :obj:`pyg:Edge`, which
+    is linked to its source and target node via :obj:`pyg:hasOutgoingEdge`
+    and :obj:`pyg:hasIncomingEdge` and carries the edge features. This way,
+    concept learners can use edge features, *e.g.*,
+    :obj:`∃ hasOutgoingEdge.DoubleBond`, and both edge features and
+    parallel edges survive a round trip.
+
+    .. note::
+
+        Ontolearn (via :obj:`owlapy`) only accepts IRIs that contain a
+        :obj:`"/"`. Prefer :obj:`http(s)` IRIs over, *e.g.*, :obj:`urn:`
+        IRIs for ontologies that are used for concept learning.
 
     .. code-block:: python
 
@@ -129,6 +201,16 @@ class OWLSchema(CastMixin):
             neither turned into node features nor used by concept learners,
             *e.g.*, classes that are trivially equivalent to the target.
             (default: :obj:`None`)
+        edge_feature_names (List[str], optional): The names of the columns of
+            :obj:`data.edge_attr`. If set to :obj:`None`, columns are named
+            :obj:`"edge_feature_{j}"`. (default: :obj:`None`)
+        edge_feature_encoding (str or List[str] or Dict[str, str], optional):
+            How each edge feature is encoded in OWL, analogous to
+            :obj:`feature_encoding`. (default: :obj:`"auto"`)
+        reify_edges (bool, optional): If set to :obj:`True`, every edge is
+            reified as an individual of class :obj:`pyg:Edge`. If set to
+            :obj:`None`, edges are only reified if the graph holds edge
+            features or parallel edges. (default: :obj:`None`)
     """
     base_iri: str
     node_class: Optional[str]
@@ -143,6 +225,9 @@ class OWLSchema(CastMixin):
     include_labels: bool
     target_classes: Optional[List[str]]
     ignore_classes: Optional[List[str]]
+    edge_feature_names: Optional[List[str]]
+    edge_feature_encoding: Union[str, List[str], Dict[str, str]]
+    reify_edges: Optional[bool]
 
     def __init__(
         self,
@@ -159,26 +244,16 @@ class OWLSchema(CastMixin):
         include_labels: bool = False,
         target_classes: Optional[Sequence[str]] = None,
         ignore_classes: Optional[Sequence[str]] = None,
+        edge_feature_names: Optional[Sequence[str]] = None,
+        edge_feature_encoding: Union[str, Sequence[str], Dict[str,
+                                                              str]] = 'auto',
+        reify_edges: Optional[bool] = None,
     ):
         if not is_absolute_iri(base_iri):
             raise ValueError(f"'base_iri' needs to be an absolute IRI "
                              f"(got '{base_iri}')")
         if not base_iri.endswith(('#', '/')):
             base_iri = base_iri + '#'
-
-        if isinstance(feature_encoding, str):
-            encodings: Iterable[str] = [feature_encoding]
-        elif isinstance(feature_encoding, dict):
-            encodings = feature_encoding.values()
-            feature_encoding = dict(feature_encoding)
-        else:
-            feature_encoding = list(feature_encoding)
-            encodings = feature_encoding
-        for encoding in encodings:
-            if encoding not in FEATURE_ENCODINGS:
-                raise ValueError(f"Unknown feature encoding '{encoding}' "
-                                 f"(expected one of "
-                                 f"{sorted(FEATURE_ENCODINGS)})")
 
         def _to_list(value: Optional[Sequence[str]]) -> Optional[List[str]]:
             return None if value is None else list(value)
@@ -189,7 +264,7 @@ class OWLSchema(CastMixin):
         self.relation_names = _to_list(relation_names)
         self.inverse_edge_types = inverse_edge_types
         self.feature_names = _to_list(feature_names)
-        self.feature_encoding = feature_encoding  # type: ignore
+        self.feature_encoding = _check_encoding(feature_encoding)
         self.feature_threshold = feature_threshold
         self.class_hierarchy = None
         if class_hierarchy is not None:
@@ -201,6 +276,9 @@ class OWLSchema(CastMixin):
         self.include_labels = include_labels
         self.target_classes = _to_list(target_classes)
         self.ignore_classes = _to_list(ignore_classes)
+        self.edge_feature_names = _to_list(edge_feature_names)
+        self.edge_feature_encoding = _check_encoding(edge_feature_encoding)
+        self.reify_edges = reify_edges
 
     def iri(self, name: str) -> str:
         r"""Returns the absolute IRI of :obj:`name`."""
@@ -232,6 +310,20 @@ class OWLSchema(CastMixin):
             return self.iri(self.feature_names[index])
         return self.iri(f'feature_{index}')
 
+    def edge_iri(self, index: int) -> str:
+        r"""Returns the IRI of the individual of (reified) edge
+        :obj:`index`.
+        """
+        return self.iri(f'edge_{index}')
+
+    def edge_feature_iri(self, index: int) -> str:
+        r"""Returns the IRI of the class or data property of edge feature
+        :obj:`index`.
+        """
+        if self.edge_feature_names is not None:
+            return self.iri(self.edge_feature_names[index])
+        return self.iri(f'edge_feature_{index}')
+
     def label_iri(self, label: int) -> str:
         r"""Returns the IRI of the OWL class of label :obj:`label`."""
         if self.label_names is not None:
@@ -242,20 +334,19 @@ class OWLSchema(CastMixin):
         r"""Returns the encoding of feature :obj:`index`, resolving
         :obj:`"auto"` based on the feature values in :obj:`column`.
         """
-        encoding = 'auto'
-        if isinstance(self.feature_encoding, str):
-            encoding = self.feature_encoding
-        elif isinstance(self.feature_encoding, list):
-            encoding = self.feature_encoding[index]
-        elif self.feature_names is not None:
-            name = self.feature_names[index]
-            encoding = self.feature_encoding.get(name, 'auto')
+        return _resolve_encoding(self.feature_encoding, self.feature_names,
+                                 index, column)
 
-        if encoding == 'auto':
-            is_binary = column is not None and bool(
-                ((column == 0) | (column == 1)).all())
-            return 'class' if is_binary else 'numeric'
-        return encoding
+    def edge_encoding(
+        self,
+        index: int,
+        column: Optional[Tensor] = None,
+    ) -> str:
+        r"""Returns the encoding of edge feature :obj:`index`, resolving
+        :obj:`"auto"` based on the feature values in :obj:`column`.
+        """
+        return _resolve_encoding(self.edge_feature_encoding,
+                                 self.edge_feature_names, index, column)
 
     def excluded_classes(self) -> List[str]:
         r"""Returns the IRIs of all classes that concept learners must not
@@ -410,15 +501,15 @@ class OWLData(Data):
             ]
         return out
 
-    def to_owl(self) -> Any:
+    def to_owl(self, **kwargs: Any) -> Any:
         r"""Converts the data object to an OWL ontology given as an
         :class:`rdflib.Graph`.
-        See :meth:`torch_geometric.utils.to_owl` for details.
+        See :meth:`torch_geometric.utils.to_owl` for the arguments.
         """
         from torch_geometric.utils import to_owl
-        return to_owl(self)
+        return to_owl(self, **kwargs)
 
-    def save_owl(self, path: str, format: str = 'xml') -> str:
+    def save_owl(self, path: str, format: str = 'xml', **kwargs: Any) -> str:
         r"""Saves the data object as an OWL ontology and returns the path.
 
         Args:
@@ -426,9 +517,11 @@ class OWLData(Data):
             format (str, optional): The :obj:`rdflib` serialization format.
                 :obj:`"xml"` (RDF/XML) can be read by every OWL tool.
                 (default: :obj:`"xml"`)
+            **kwargs (optional): Additional arguments of
+                :meth:`torch_geometric.utils.to_owl`.
         """
         path = osp.expanduser(path)
-        self.to_owl().serialize(destination=path, format=format)
+        self.to_owl(**kwargs).serialize(destination=path, format=format)
         return path
 
     def index_of(self, iris: Union[str, Iterable[str]]) -> Tensor:

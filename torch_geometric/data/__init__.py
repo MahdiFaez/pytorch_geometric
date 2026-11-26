@@ -9,6 +9,7 @@ from .data import Data
 from .hetero_data import HeteroData
 from .batch import Batch
 from .temporal import TemporalData
+from .owl_data import OWLData, OWLSchema
 from .database import Database, SQLiteDatabase, RocksDatabase
 from .dataset import Dataset
 from .in_memory_dataset import InMemoryDataset
@@ -24,6 +25,8 @@ data_classes = [
     'HeteroData',
     'Batch',
     'TemporalData',
+    'OWLData',
+    'OWLSchema',
     'Dataset',
     'InMemoryDataset',
     'OnDiskDataset',
@@ -78,6 +81,8 @@ if torch_geometric.typing.WITH_PT24:
         Data,
         HeteroData,
         TemporalData,
+        OWLData,
+        OWLSchema,
         ClusterData,
         TensorAttr,
         EdgeAttr,

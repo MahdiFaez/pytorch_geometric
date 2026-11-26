@@ -301,3 +301,131 @@ def test_from_owl_skips_builtin_classes():
     names = out.schema.feature_names
     assert str(datatype) not in names
     assert str(OWL.Thing) not in names
+
+
+def get_hetero_data():
+    from torch_geometric.data import HeteroData
+    from torch_geometric.transforms import ToUndirected
+
+    data = HeteroData()
+    data['author'].x = torch.tensor([[1.0, 0.0, 30.0], [0.0, 1.0, 40.0]])
+    data['paper'].x = torch.tensor([[1.0], [0.0], [1.0]])
+    data['author', 'writes', 'paper'].edge_index = torch.tensor([
+        [0, 0, 1],
+        [0, 1, 2],
+    ])
+    data['author', 'writes', 'paper'].edge_attr = torch.tensor([1., 2., 3.])
+    data['paper', 'cites', 'paper'].edge_index = torch.tensor([[0, 1], [1, 2]])
+    return ToUndirected()(data)
+
+
+def get_hetero_schema(**kwargs) -> OWLSchema:
+    return OWLSchema(
+        base_iri=BASE,
+        node_class='Thing',
+        inverse_edge_types=True,
+        feature_names={
+            'author': ['Senior', 'Junior', 'age'],
+            'paper': ['Theory'],
+        },
+        edge_feature_names={'writes': ['position']},
+        **kwargs,
+    )
+
+
+@withPackage('rdflib')
+def test_hetero_to_owl():
+    from rdflib import Literal, URIRef
+    from rdflib.namespace import RDF, RDFS, XSD
+
+    graph = to_owl(get_hetero_data(), get_hetero_schema())
+
+    def iri(name: str) -> URIRef:
+        return URIRef(BASE + name)
+
+    assert (iri('author_0'), RDF.type, iri('author')) in graph
+    assert (iri('paper_2'), RDF.type, iri('paper')) in graph
+    assert (iri('author'), RDFS.subClassOf, iri('Thing')) in graph
+    assert (iri('author_0'), RDF.type, iri('Senior')) in graph
+    assert (iri('author_1'), iri('age'), Literal(40.0,
+                                                 datatype=XSD.double)) in graph
+    assert (iri('paper_0'), RDF.type, iri('Theory')) in graph
+    assert (iri('author_1'), iri('writes'), iri('paper_2')) in graph
+    assert (iri('paper_0'), iri('cites'), iri('paper_1')) in graph
+    # Reverse edge types are implied by their forward edge type:
+    assert len(list(graph.triples((None, iri('rev_writes'), None)))) == 0
+
+    with pytest.raises(ValueError, match="encodings of heterogeneous"):
+        to_owl(get_hetero_data(), OWLSchema(feature_encoding=['class']))
+    with pytest.raises(ValueError, match="of node type 'paper'"):
+        to_owl(get_hetero_data(), OWLSchema(feature_names={'paper': []}))
+
+
+@withPackage('rdflib')
+def test_hetero_from_owl():
+    from torch_geometric.data import OWLHeteroData
+
+    data = get_hetero_data()
+    graph = to_owl(data, get_hetero_schema())
+    out = from_owl(graph, node_types=['author', 'paper'])
+    assert isinstance(out, OWLHeteroData)
+    assert set(out.node_types) == {'author', 'paper'}
+    assert set(out.edge_types) == {
+        ('author', 'writes', 'paper'),
+        ('paper', 'rev_writes', 'author'),
+        ('paper', 'cites', 'paper'),
+        ('paper', 'rev_cites', 'paper'),
+    }
+    assert out['author'].node_iri == [BASE + 'author_0', BASE + 'author_1']
+    assert out.schema.node_type_names == {
+        'author': BASE + 'author',
+        'paper': BASE + 'paper',
+    }
+    assert out.schema.relation_names == {
+        'writes': BASE + 'writes',
+        'cites': BASE + 'cites',
+    }
+
+    # Node type classes and their super classes are no features:
+    assert out.schema.feature_names['author'][:3] == [
+        BASE + 'Senior', BASE + 'Junior', BASE + 'age'
+    ]
+    assert torch.equal(out['author'].x[:, :3], data['author'].x)
+    assert torch.equal(out['paper'].x[:, :1], data['paper'].x)
+
+    store = out['author', 'writes', 'paper']
+    assert torch.equal(store.edge_index, data['author', 'writes',
+                                              'paper'].edge_index)
+    assert store.edge_attr.view(-1).tolist() == [1.0, 2.0, 3.0]
+    store = out['paper', 'rev_writes', 'author']
+    assert store.edge_index.tolist() == [[0, 1, 2], [0, 0, 1]]
+    assert store.edge_attr.view(-1).tolist() == [1.0, 2.0, 3.0]
+    assert out.schema.edge_feature_names == {'writes': [BASE + 'position']}
+
+    # Converting twice is lossless:
+    out2 = from_owl(out.to_owl(), node_types=['author', 'paper'])
+    for node_type in out.node_types:
+        assert out2[node_type].node_iri == out[node_type].node_iri
+        assert torch.equal(out2[node_type].x, out[node_type].x)
+    for edge_type in out.edge_types:
+        assert torch.equal(out2[edge_type].edge_index,
+                           out[edge_type].edge_index)
+
+    # Labels are set for every node type:
+    out = from_owl(graph, node_types=['author', 'paper'],
+                   target_classes=['Theory'])
+    assert out['paper'].y.tolist() == [1, 0, 1]
+    assert out['author'].y.tolist() == [0, 0]
+    # `Theory` was the only feature of papers:
+    assert 'x' not in out['paper']
+    assert 'paper' not in out.schema.feature_names
+
+    with pytest.warns(UserWarning, match="belong to none of the node types"):
+        out = from_owl(graph, node_types=['paper'], add_inverse_edges=False)
+    assert out.node_types == ['paper']
+    assert out.edge_types == [('paper', 'cites', 'paper')]
+
+    with pytest.warns(UserWarning, match="more than one node type"):
+        from_owl(graph, node_types=['author', 'Thing', 'paper'])
+    with pytest.raises(ValueError, match="duplicated node types"):
+        from_owl(graph, node_types=['author', 'author'])

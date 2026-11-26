@@ -10,13 +10,19 @@ from typing import Any, Dict, Iterator, List, Optional, Sequence, Tuple, Union
 import torch
 from torch import Tensor
 
-from torch_geometric.data import Data, OWLData, OWLSchema
+from torch_geometric.data import (
+    Data,
+    HeteroData,
+    OWLData,
+    OWLHeteroData,
+    OWLSchema,
+)
 from torch_geometric.data.owl_data import (
     is_absolute_iri,
     local_name,
     to_owl_schema,
 )
-from torch_geometric.explain import Explanation
+from torch_geometric.explain import Explanation, HeteroExplanation
 from torch_geometric.explain.algorithm import ExplainerAlgorithm
 from torch_geometric.explain.config import MaskType, ModelMode, ModelTaskLevel
 
@@ -129,6 +135,12 @@ class OntolearnExplainer(ExplainerAlgorithm):
                                 edge_type=data.edge_type)
         print(explanation.concept)
 
+    For heterogeneous graphs, :obj:`data` is an
+    :class:`~torch_geometric.data.OWLHeteroData` object, :obj:`node_type`
+    is the node type that the model makes predictions for, and the returned
+    :class:`~torch_geometric.explain.HeteroExplanation` holds one
+    :obj:`node_mask` per node type.
+
     .. note::
 
         This explainer requires the :obj:`ontolearn` package.
@@ -143,8 +155,9 @@ class OntolearnExplainer(ExplainerAlgorithm):
             already initialized learner instance (which then needs to be
             bound to a knowledge base of the same graph).
             (default: :obj:`"EvoLearner"`)
-        data (OWLData, optional): The graph to explain. If it was read from an
-            OWL file, the original ontology is used, including its full TBox.
+        data (OWLData or OWLHeteroData, optional): The graph to explain. If
+            it was read from an OWL file, the original ontology is used,
+            including its full TBox.
             If set to :obj:`None`, an ontology is derived from the inputs of
             the explainer and :obj:`schema`. (default: :obj:`None`)
         schema (OWLSchema or Dict[str, Any], optional): The schema used to
@@ -167,6 +180,9 @@ class OntolearnExplainer(ExplainerAlgorithm):
             number of positive and negative examples. (default: :obj:`False`)
         seed (int, optional): The seed used for sampling examples.
             (default: :obj:`None`)
+        node_type (str, optional): The node type to explain in heterogeneous
+            graphs. Can be omitted for graphs with a single node type.
+            (default: :obj:`None`)
         **kwargs (optional): Additional arguments passed to the concept
             learner, *e.g.*, :obj:`max_runtime`.
     """
@@ -175,7 +191,7 @@ class OntolearnExplainer(ExplainerAlgorithm):
     def __init__(
         self,
         learner: Union[str, Any] = 'EvoLearner',
-        data: Optional[OWLData] = None,
+        data: Optional[Union[Data, HeteroData]] = None,
         schema: Optional[Union[OWLSchema, Dict[str, Any]]] = None,
         ignore_classes: Optional[Sequence[str]] = None,
         target_class: Optional[int] = None,
@@ -184,6 +200,7 @@ class OntolearnExplainer(ExplainerAlgorithm):
         max_examples: Optional[int] = None,
         balanced: bool = False,
         seed: Optional[int] = None,
+        node_type: Optional[str] = None,
         **kwargs: Any,
     ):
         super().__init__()
@@ -195,7 +212,10 @@ class OntolearnExplainer(ExplainerAlgorithm):
                                  f"support the learner '{learner}' (expected "
                                  f"one of {self.SUPPORTED_LEARNERS})")
             learner = names[learner.lower()]
-        if data is not None and not isinstance(data, OWLData):
+        if isinstance(data, HeteroData):
+            if not isinstance(data, OWLHeteroData):
+                data = OWLHeteroData.from_data(data, schema)
+        elif data is not None and not isinstance(data, OWLData):
             data = OWLData.from_data(data, schema)
         if num_hypotheses < 1:
             raise ValueError(f"'num_hypotheses' needs to be positive (got "
@@ -211,31 +231,35 @@ class OntolearnExplainer(ExplainerAlgorithm):
         self.max_examples = max_examples
         self.balanced = balanced
         self.seed = seed
+        self.node_type = node_type
         self.learner_kwargs = kwargs
 
         self._tmp_dir: Any = None
         self._kb_key: Optional[Tuple[Any, ...]] = None
         self._kb: Any = None
         self._concept_learner: Any = None
+        # The IRIs of the explained nodes, and the node type and index of
+        # every individual (with node type `None` in homogeneous graphs):
         self._node_iri: List[str] = []
+        self._iri_index: Dict[str, Tuple[Optional[str], int]] = {}
         self._cache: Dict[Tuple[Any, ...], Dict[str, Any]] = {}
 
     def forward(
         self,
         model: torch.nn.Module,
-        x: Tensor,
-        edge_index: Tensor,
+        x: Union[Tensor, Dict[str, Tensor]],
+        edge_index: Union[Tensor, Dict[Any, Tensor]],
         *,
         target: Tensor,
         index: Optional[Union[int, Tensor]] = None,
         **kwargs: Any,
-    ) -> Explanation:
-        if isinstance(x, dict) or isinstance(edge_index, dict):
-            raise NotImplementedError(f"Heterogeneous graphs are not yet "
-                                      f"supported in "
-                                      f"'{self.__class__.__name__}'")
+    ) -> Union[Explanation, HeteroExplanation]:
+        node_type = self._get_node_type(x)
+        if isinstance(x, dict):
+            num_nodes = x[node_type].size(0)
+        else:
+            num_nodes = x.size(0)
 
-        num_nodes = x.size(0)
         if target.dim() > 1:
             target = target.view(-1) if target.size(-1) == 1 else target
         if target.dim() != 1 or target.numel() != num_nodes:
@@ -243,8 +267,7 @@ class OntolearnExplainer(ExplainerAlgorithm):
                              f"of shape {tuple(target.size())})")
         target = target.detach().cpu().long()
 
-        self._prepare_knowledge_base(x, edge_index, kwargs.get('edge_type'),
-                                     kwargs.get('edge_attr'))
+        self._prepare_knowledge_base(x, edge_index, node_type, kwargs)
         cls = self._get_class(target, index)
         pos, neg = self._get_examples(target, cls)
 
@@ -253,17 +276,32 @@ class OntolearnExplainer(ExplainerAlgorithm):
             self._cache[key] = self._learn(pos, neg)
         result = self._cache[key]
 
-        node_mask = torch.zeros(num_nodes, 1, device=x.device)
-        node_mask[result['members'].to(x.device)] = 1.0
+        def node_mask(size: int, members: Optional[Tensor],
+                      device: torch.device) -> Tensor:
+            mask = torch.zeros(size, 1, device=device)
+            if members is not None:
+                mask[members.to(device)] = 1.0
+            return mask
 
-        explanation = Explanation(
-            node_mask=node_mask,
-            concept=result['concepts'][0],
-            concepts=result['concepts'],
-            concept_class=cls,
-            concept_accuracy=result['accuracy'],
-            concept_f1=result['f1'],
-        )
+        explanation: Union[Explanation, HeteroExplanation]
+        if isinstance(x, dict):
+            explanation = HeteroExplanation()
+            explanation.set_value_dict(
+                'node_mask', {
+                    key:
+                    node_mask(value.size(0), result['members'].get(key),
+                              value.device)
+                    for key, value in x.items()
+                })
+        else:
+            explanation = Explanation(node_mask=node_mask(
+                num_nodes, result['members'].get(None), x.device))
+
+        explanation.concept = result['concepts'][0]
+        explanation.concepts = result['concepts']
+        explanation.concept_class = cls
+        explanation.concept_accuracy = result['accuracy']
+        explanation.concept_f1 = result['f1']
         explanation._class_expressions = result['class_expressions']
         return explanation
 
@@ -303,24 +341,65 @@ class OntolearnExplainer(ExplainerAlgorithm):
 
     ###########################################################################
 
+    def _get_node_type(
+        self,
+        x: Union[Tensor, Dict[str, Tensor]],
+    ) -> Optional[str]:
+        r"""Returns the explained node type of heterogeneous graphs."""
+        if not isinstance(x, dict):
+            return None
+        if self.node_type is not None:
+            if self.node_type not in x:
+                raise ValueError(f"The node type '{self.node_type}' is not "
+                                 f"part of the input (got {list(x.keys())})")
+            return self.node_type
+        if len(x) == 1:
+            return next(iter(x.keys()))
+        raise ValueError(f"'{self.__class__.__name__}' requires 'node_type' "
+                         f"to be set for heterogeneous graphs with more than "
+                         f"one node type")
+
     def _prepare_knowledge_base(
         self,
-        x: Tensor,
-        edge_index: Tensor,
-        edge_type: Optional[Tensor],
-        edge_attr: Optional[Tensor] = None,
+        x: Union[Tensor, Dict[str, Tensor]],
+        edge_index: Union[Tensor, Dict[Any, Tensor]],
+        node_type: Optional[str],
+        kwargs: Dict[str, Any],
     ) -> None:
         r"""Builds (or re-uses) the knowledge base and concept learner."""
-        if self.data is not None and self.data.num_nodes != x.size(0):
-            raise ValueError(f"The number of nodes in 'data' "
-                             f"({self.data.num_nodes}) does not match the "
-                             f"number of nodes in the input ({x.size(0)})")
+        if isinstance(x, dict):
+            if not isinstance(edge_index, dict):
+                raise ValueError("Expected 'edge_index' to be a dictionary "
+                                 "for heterogeneous graphs")
+            if self.data is not None and not isinstance(
+                    self.data, OWLHeteroData):
+                raise ValueError("Expected 'data' to be heterogeneous for "
+                                 "heterogeneous inputs")
+            if self.data is not None:
+                for key, value in x.items():
+                    num_nodes = self.data[key].num_nodes
+                    if num_nodes != value.size(0):
+                        raise ValueError(
+                            f"The number of nodes of type '{key}' in 'data' "
+                            f"({num_nodes}) does not match the number of "
+                            f"nodes in the input ({value.size(0)})")
+            tensors = list(x.values()) + list(edge_index.values())
+        else:
+            if isinstance(self.data, OWLHeteroData):
+                raise ValueError("Expected 'data' to be homogeneous for "
+                                 "homogeneous inputs")
+            if self.data is not None and self.data.num_nodes != x.size(0):
+                raise ValueError(f"The number of nodes in 'data' "
+                                 f"({self.data.num_nodes}) does not match the "
+                                 f"number of nodes in the input ({x.size(0)})")
+            assert isinstance(edge_index, Tensor)
+            tensors = [x, edge_index]
 
         if self.data is not None:
-            key: Tuple[Any, ...] = (id(self.data), )
+            key: Tuple[Any, ...] = (id(self.data), node_type)
         else:
-            key = (x.data_ptr(), tuple(x.size()), edge_index.data_ptr(),
-                   edge_index.size(1))
+            key = (node_type, ) + tuple(
+                (t.data_ptr(), tuple(t.size())) for t in tensors)
         if key == self._kb_key:
             return
 
@@ -331,17 +410,37 @@ class OntolearnExplainer(ExplainerAlgorithm):
                               f"'ontolearn' package (install it via "
                               f"`pip install ontolearn`)") from e
 
-        data = self.data
-        if data is None:
+        data: Union[OWLData, OWLHeteroData, None] = self.data
+        if data is None and isinstance(x, dict):
+            assert isinstance(edge_index, dict)
+            hetero = HeteroData()
+            for key_, value in x.items():
+                hetero[key_].x = value.detach().cpu()
+            for key_, value in edge_index.items():
+                hetero[key_].edge_index = value.detach().cpu()
+            data = OWLHeteroData.from_data(hetero, self.schema)
+        elif data is None:
+            assert isinstance(x, Tensor) and isinstance(edge_index, Tensor)
             data = OWLData.from_data(
                 Data(x=x.detach().cpu(), edge_index=edge_index.detach().cpu(),
-                     edge_type=edge_type, edge_attr=edge_attr,
-                     num_nodes=x.size(0)),
+                     edge_type=kwargs.get('edge_type'),
+                     edge_attr=kwargs.get('edge_attr'), num_nodes=x.size(0)),
                 self.schema,
             )
+        assert data is not None
+
+        iri_index: Dict[str, Tuple[Optional[str], int]] = {}
+        if isinstance(data, OWLHeteroData):
+            for key_, store in data.node_items():
+                for i, iri in enumerate(store.node_iri):
+                    iri_index[iri] = (key_, i)
+            node_iri = list(data[node_type].node_iri)
+        else:
+            iri_index = {iri: (None, i) for i, iri in enumerate(data.node_iri)}
+            node_iri = list(data.node_iri)
 
         # `owlapy` rejects IRIs without a "/", *e.g.*, "urn:" IRIs:
-        invalid = [iri for iri in data.node_iri if '/' not in iri]
+        invalid = [iri for iri in iri_index.keys() if '/' not in iri]
         if len(invalid) > 0:
             raise ValueError(f"Ontolearn only supports IRIs that contain a "
                              f"'/' (got '{invalid[0]}'). Use an 'http(s)' "
@@ -394,7 +493,8 @@ class OntolearnExplainer(ExplainerAlgorithm):
             kb = getattr(learner, 'kb', kb)
 
         self._kb, self._concept_learner = kb, learner
-        self._node_iri = list(data.node_iri)
+        self._node_iri = node_iri
+        self._iri_index = iri_index
         self._kb_key = key
         self._cache = {}
 
@@ -485,14 +585,22 @@ class OntolearnExplainer(ExplainerAlgorithm):
             raise RuntimeError("The concept learner did not return any class "
                                "expression")
 
-        mapping = {iri: i for i, iri in enumerate(self._node_iri)}
         instances = self._kb.individuals_set(expressions[0])
-        members = sorted(mapping[ind.str] for ind in instances
-                         if ind.str in mapping)
-        members_tensor = torch.tensor(members, dtype=torch.long)
+        index: Dict[Optional[str], List[int]] = defaultdict(list)
+        for individual in instances:
+            if individual.str in self._iri_index:
+                key, i = self._iri_index[individual.str]
+                index[key].append(i)
+        members = {
+            key: torch.tensor(sorted(value), dtype=torch.long)
+            for key, value in index.items()
+        }
 
+        mapping = {iri: i for i, iri in enumerate(self._node_iri)}
         covered = torch.zeros(len(self._node_iri), dtype=torch.bool)
-        covered[members_tensor] = True
+        for individual in instances:
+            if individual.str in mapping:
+                covered[mapping[individual.str]] = True
         tp = int(covered[pos].sum())
         fp = int(covered[neg].sum())
         fn = pos.numel() - tp
@@ -504,7 +612,7 @@ class OntolearnExplainer(ExplainerAlgorithm):
         return dict(
             concepts=[renderer.render(e) for e in expressions],
             class_expressions=expressions,
-            members=members_tensor,
+            members=members,
             accuracy=accuracy,
             f1=f1,
         )

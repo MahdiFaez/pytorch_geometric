@@ -261,3 +261,81 @@ def test_ontolearn_explainer_urn_iris():
     explainer = get_explainer(OntolearnExplainer(schema=schema))
     with pytest.raises(ValueError, match="contain a '/'"):
         explainer(data.x, data.edge_index, target=data.y, index=0)
+
+
+class HeteroConstantModel(torch.nn.Module):
+    def forward(self, x_dict, edge_index_dict, **kwargs):
+        return torch.zeros(x_dict['author'].size(0), 2)
+
+
+def get_hetero_data():
+    from torch_geometric.data import HeteroData
+
+    # Author `i` writes paper `i`, and papers with an even index are theory
+    # papers. The planted concept of class 1 is `∃ writes.Theory`:
+    num_nodes = 8
+    data = HeteroData()
+    data['author'].x = torch.ones(num_nodes, 1)
+    theory = (torch.arange(num_nodes) % 2 == 0).float().view(-1, 1)
+    data['paper'].x = torch.cat([theory, 1 - theory], dim=1)
+    data['author', 'writes',
+         'paper'].edge_index = torch.arange(num_nodes).repeat(2, 1)
+    data['author'].y = theory.view(-1).long()
+    return data
+
+
+@withPackage('ontolearn', 'rdflib')
+@pytest.mark.parametrize('use_data', [False, True])
+def test_ontolearn_explainer_hetero(use_data, tmp_path):
+    from torch_geometric.data import OWLHeteroData
+    from torch_geometric.explain import HeteroExplanation
+
+    data = get_hetero_data()
+    schema = OWLSchema(
+        base_iri=BASE, feature_names={
+            'author': ['Author'],
+            'paper': ['Theory', 'Systems'],
+        })
+    kwargs = dict(schema=schema)
+    if use_data:
+        path = OWLHeteroData.from_data(data, schema).save_owl(
+            str(tmp_path / 'graph.owl'))
+        kwargs = dict(data=OWLHeteroData.from_owl(path, ['author', 'paper']))
+
+    algorithm = OntolearnExplainer('EvoLearner', node_type='author', seed=0,
+                                   ignore_classes=['Systems'], max_runtime=5,
+                                   **kwargs)
+    explainer = get_explainer(algorithm, model=HeteroConstantModel())
+    explanation = explainer(data.x_dict, data.edge_index_dict,
+                            target=data['author'].y, index=0)
+    assert isinstance(explanation, HeteroExplanation)
+    assert explanation.concept_class == 1
+    assert explanation.concept_accuracy == 1.0
+    assert 'writes' in explanation.concept
+    mask = explanation['author'].node_mask.view(-1)
+    assert mask.tolist() == data['author'].y.float().tolist()
+    assert explanation['paper'].node_mask.size() == (8, 1)
+
+
+@withPackage('ontolearn', 'rdflib')
+def test_ontolearn_explainer_hetero_errors():
+    data = get_hetero_data()
+    explainer = get_explainer(OntolearnExplainer(),
+                              model=HeteroConstantModel())
+    with pytest.raises(ValueError, match="requires 'node_type'"):
+        explainer(data.x_dict, data.edge_index_dict, target=data['author'].y,
+                  index=0)
+
+    explainer = get_explainer(OntolearnExplainer(node_type='venue'),
+                              model=HeteroConstantModel())
+    with pytest.raises(ValueError, match="'venue' is not part"):
+        explainer(data.x_dict, data.edge_index_dict, target=data['author'].y,
+                  index=0)
+
+    homogeneous = OWLData.from_data(get_data(), get_schema())
+    explainer = get_explainer(
+        OntolearnExplainer(data=homogeneous, node_type='author'),
+        model=HeteroConstantModel())
+    with pytest.raises(ValueError, match="to be heterogeneous"):
+        explainer(data.x_dict, data.edge_index_dict, target=data['author'].y,
+                  index=0)

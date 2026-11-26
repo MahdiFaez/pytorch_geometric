@@ -139,3 +139,37 @@ def test_owl_data_from_owl(tmp_path):
     out = OWLData.from_data(out)
     assert out.source == path
     assert out.schema.target_classes == ['http://example.org/test#Red']
+
+
+@withPackage('rdflib')
+def test_owl_hetero_data():
+    from torch_geometric.data import HeteroData, OWLHeteroData
+
+    BASE = 'http://example.org/test#'
+
+    data = HeteroData()
+    data['author'].x = torch.randn(2, 4)
+    data['paper'].num_nodes = 3
+    data['author', 'writes', 'paper'].edge_index = torch.tensor([[0, 1],
+                                                                 [1, 2]])
+
+    schema = OWLSchema(base_iri=BASE, node_names={'paper': ['a', 'b', 'c']})
+    data = OWLHeteroData.from_data(data, schema)
+    assert data['author'].node_iri == [BASE + 'author_0', BASE + 'author_1']
+    assert data['paper'].node_iri == [BASE + 'a', BASE + 'b', BASE + 'c']
+    assert data.index_of([BASE + 'c', BASE + 'a'], 'paper').tolist() == [2, 0]
+    with pytest.raises(KeyError, match="of node type 'paper'"):
+        data.index_of(BASE + 'author_0', 'paper')
+
+    # The schema is not part of the attribute storage:
+    data.schema = dict(base_iri='http://example.org/other#')
+    assert data.schema.base_iri == 'http://example.org/other#'
+    assert 'schema' not in data._global_store
+    assert copy.copy(data).schema is data.schema
+    assert pickle.loads(pickle.dumps(data)).schema.base_iri == \
+        data.schema.base_iri
+
+    with pytest.raises(ValueError, match="OWLHeteroData.from_owl"):
+        OWLData.from_owl(data.to_owl(), node_types=['author'])
+    out = OWLHeteroData.from_owl(data.to_owl(), node_types=['author', 'paper'])
+    assert out['paper'].num_nodes == 3

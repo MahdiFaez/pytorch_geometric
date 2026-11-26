@@ -1,13 +1,23 @@
 import os.path as osp
 import re
 from dataclasses import dataclass
-from typing import Any, Dict, Iterable, List, Optional, Sequence, Union
+from typing import (
+    Any,
+    Dict,
+    Iterable,
+    List,
+    Mapping,
+    Optional,
+    Sequence,
+    Union,
+)
 from urllib.parse import quote
 
 import torch
 from torch import Tensor
 
 from torch_geometric.data.data import Data
+from torch_geometric.data.hetero_data import HeteroData
 from torch_geometric.typing import OptTensor
 from torch_geometric.utils.mixin import CastMixin
 
@@ -49,16 +59,41 @@ def natural_key(name: str) -> List[Any]:
             for part in re.split(r'(\d+)', name)]
 
 
+Names = Union[List[str], Dict[str, List[str]]]
+
+
+def _to_names(value: Any) -> Optional[Names]:
+    if value is None:
+        return None
+    if isinstance(value, dict):
+        return {key: list(names) for key, names in value.items()}
+    return list(value)
+
+
+def _select(names: Optional[Names], key: Optional[str]) -> Optional[List[str]]:
+    r"""Returns the names of node/edge type :obj:`key` in case :obj:`names`
+    is given per type.
+    """
+    if isinstance(names, dict):
+        return names.get(key) if key is not None else None
+    return names
+
+
 def _resolve_encoding(
     spec: Union[str, List[str], Dict[str, str]],
     names: Optional[List[str]],
     index: int,
     column: Optional[Tensor],
+    per_type: bool = False,
 ) -> str:
     encoding = 'auto'
     if isinstance(spec, str):
         encoding = spec
     elif isinstance(spec, list):
+        if per_type:
+            raise ValueError("Feature encodings of heterogeneous graphs need "
+                             "to be given as a string or as a dictionary "
+                             "that maps feature names to encodings")
         encoding = spec[index]
     elif names is not None:
         encoding = spec.get(names[index], 'auto')
@@ -116,6 +151,14 @@ class OWLSchema(CastMixin):
     concept learners can use edge features, *e.g.*,
     :obj:`∃ hasOutgoingEdge.DoubleBond`, and both edge features and
     parallel edges survive a round trip.
+
+    For heterogeneous graphs (see
+    :class:`~torch_geometric.data.OWLHeteroData`), every node type becomes an
+    OWL class (a sub class of :obj:`node_class`), and every relation of an
+    edge type :obj:`(src, rel, dst)` an object property. Then,
+    :obj:`node_names` and :obj:`feature_names` are dictionaries that map
+    node types to names, and :obj:`relation_names` and
+    :obj:`edge_feature_names` are dictionaries that map relations to names.
 
     .. note::
 
@@ -211,13 +254,16 @@ class OWLSchema(CastMixin):
             reified as an individual of class :obj:`pyg:Edge`. If set to
             :obj:`None`, edges are only reified if the graph holds edge
             features or parallel edges. (default: :obj:`None`)
+        node_type_names (Dict[str, str], optional): Maps node types of
+            heterogeneous graphs to the names of their OWL classes. Unlisted
+            node types use the node type itself. (default: :obj:`None`)
     """
     base_iri: str
     node_class: Optional[str]
-    node_names: Optional[List[str]]
-    relation_names: Optional[List[str]]
+    node_names: Optional[Names]
+    relation_names: Optional[Union[List[str], Dict[str, str]]]
     inverse_edge_types: bool
-    feature_names: Optional[List[str]]
+    feature_names: Optional[Names]
     feature_encoding: Union[str, List[str], Dict[str, str]]
     feature_threshold: float
     class_hierarchy: Optional[Dict[str, Union[str, List[str]]]]
@@ -225,18 +271,21 @@ class OWLSchema(CastMixin):
     include_labels: bool
     target_classes: Optional[List[str]]
     ignore_classes: Optional[List[str]]
-    edge_feature_names: Optional[List[str]]
+    edge_feature_names: Optional[Names]
     edge_feature_encoding: Union[str, List[str], Dict[str, str]]
     reify_edges: Optional[bool]
+    node_type_names: Optional[Dict[str, str]]
 
     def __init__(
         self,
         base_iri: str = 'http://example.org/pyg#',
         node_class: Optional[str] = 'Node',
-        node_names: Optional[Sequence[str]] = None,
-        relation_names: Optional[Sequence[str]] = None,
+        node_names: Optional[Union[Sequence[str], Dict[str,
+                                                       Sequence[str]]]] = None,
+        relation_names: Optional[Union[Sequence[str], Dict[str, str]]] = None,
         inverse_edge_types: bool = False,
-        feature_names: Optional[Sequence[str]] = None,
+        feature_names: Optional[Union[Sequence[str],
+                                      Mapping[str, Sequence[str]]]] = None,
         feature_encoding: Union[str, Sequence[str], Dict[str, str]] = 'auto',
         feature_threshold: float = 0.0,
         class_hierarchy: Optional[Dict[str, Union[str, Sequence[str]]]] = None,
@@ -244,10 +293,13 @@ class OWLSchema(CastMixin):
         include_labels: bool = False,
         target_classes: Optional[Sequence[str]] = None,
         ignore_classes: Optional[Sequence[str]] = None,
-        edge_feature_names: Optional[Sequence[str]] = None,
+        edge_feature_names: Optional[Union[Sequence[str],
+                                           Mapping[str,
+                                                   Sequence[str]]]] = None,
         edge_feature_encoding: Union[str, Sequence[str], Dict[str,
                                                               str]] = 'auto',
         reify_edges: Optional[bool] = None,
+        node_type_names: Optional[Dict[str, str]] = None,
     ):
         if not is_absolute_iri(base_iri):
             raise ValueError(f"'base_iri' needs to be an absolute IRI "
@@ -260,10 +312,11 @@ class OWLSchema(CastMixin):
 
         self.base_iri = base_iri
         self.node_class = node_class
-        self.node_names = _to_list(node_names)
-        self.relation_names = _to_list(relation_names)
+        self.node_names = _to_names(node_names)
+        self.relation_names = (dict(relation_names) if isinstance(
+            relation_names, dict) else _to_list(relation_names))
         self.inverse_edge_types = inverse_edge_types
-        self.feature_names = _to_list(feature_names)
+        self.feature_names = _to_names(feature_names)
         self.feature_encoding = _check_encoding(feature_encoding)
         self.feature_threshold = feature_threshold
         self.class_hierarchy = None
@@ -276,9 +329,11 @@ class OWLSchema(CastMixin):
         self.include_labels = include_labels
         self.target_classes = _to_list(target_classes)
         self.ignore_classes = _to_list(ignore_classes)
-        self.edge_feature_names = _to_list(edge_feature_names)
+        self.edge_feature_names = _to_names(edge_feature_names)
         self.edge_feature_encoding = _check_encoding(edge_feature_encoding)
         self.reify_edges = reify_edges
+        self.node_type_names = (None if node_type_names is None else
+                                dict(node_type_names))
 
     def iri(self, name: str) -> str:
         r"""Returns the absolute IRI of :obj:`name`."""
@@ -286,28 +341,52 @@ class OWLSchema(CastMixin):
             return name
         return self.base_iri + quote(name.strip().replace(' ', '_'), safe='')
 
-    def node_iri(self, index: int) -> str:
-        r"""Returns the IRI of the individual of node :obj:`index`."""
-        if self.node_names is not None:
-            return self.iri(self.node_names[index])
+    def node_iri(self, index: int, node_type: Optional[str] = None) -> str:
+        r"""Returns the IRI of the individual of node :obj:`index` (of
+        type :obj:`node_type` in heterogeneous graphs).
+        """
+        names = _select(self.node_names, node_type)
+        if names is not None:
+            return self.iri(names[index])
+        if node_type is not None:
+            return self.iri(f'{node_type}_{index}')
         return self.iri(f'node_{index}')
 
-    def relation_iri(self, relation: int, num_relations: int = 1) -> str:
-        r"""Returns the IRI of the object property of relation
-        :obj:`relation`.
+    def node_type_iri(self, node_type: str) -> str:
+        r"""Returns the IRI of the OWL class of node type
+        :obj:`node_type`.
         """
-        if self.relation_names is not None:
+        return self.iri((self.node_type_names or {}).get(node_type, node_type))
+
+    def relation_iri(
+        self,
+        relation: Union[int, str],
+        num_relations: int = 1,
+    ) -> str:
+        r"""Returns the IRI of the object property of relation
+        :obj:`relation`, given as an edge type index or, in heterogeneous
+        graphs, as the relation of an edge type.
+        """
+        if isinstance(relation, str):
+            names = self.relation_names
+            if isinstance(names, dict):
+                return self.iri(names.get(relation, relation))
+            return self.iri(relation)
+        if isinstance(self.relation_names, list):
             return self.iri(self.relation_names[relation])
         if num_relations == 1:
             return self.iri('related_to')
         return self.iri(f'relation_{relation}')
 
-    def feature_iri(self, index: int) -> str:
+    def feature_iri(self, index: int, node_type: Optional[str] = None) -> str:
         r"""Returns the IRI of the class or data property of feature
-        :obj:`index`.
+        :obj:`index` (of node type :obj:`node_type` in heterogeneous graphs).
         """
-        if self.feature_names is not None:
-            return self.iri(self.feature_names[index])
+        names = _select(self.feature_names, node_type)
+        if names is not None:
+            return self.iri(names[index])
+        if node_type is not None:
+            return self.iri(f'{node_type}_feature_{index}')
         return self.iri(f'feature_{index}')
 
     def edge_iri(self, index: int) -> str:
@@ -316,12 +395,19 @@ class OWLSchema(CastMixin):
         """
         return self.iri(f'edge_{index}')
 
-    def edge_feature_iri(self, index: int) -> str:
+    def edge_feature_iri(
+        self,
+        index: int,
+        relation: Optional[str] = None,
+    ) -> str:
         r"""Returns the IRI of the class or data property of edge feature
-        :obj:`index`.
+        :obj:`index` (of relation :obj:`relation` in heterogeneous graphs).
         """
-        if self.edge_feature_names is not None:
-            return self.iri(self.edge_feature_names[index])
+        names = _select(self.edge_feature_names, relation)
+        if names is not None:
+            return self.iri(names[index])
+        if relation is not None:
+            return self.iri(f'{relation}_feature_{index}')
         return self.iri(f'edge_feature_{index}')
 
     def label_iri(self, label: int) -> str:
@@ -330,23 +416,33 @@ class OWLSchema(CastMixin):
             return self.iri(self.label_names[label])
         return self.iri(f'label_{label}')
 
-    def encoding(self, index: int, column: Optional[Tensor] = None) -> str:
-        r"""Returns the encoding of feature :obj:`index`, resolving
-        :obj:`"auto"` based on the feature values in :obj:`column`.
+    def encoding(
+        self,
+        index: int,
+        column: Optional[Tensor] = None,
+        node_type: Optional[str] = None,
+    ) -> str:
+        r"""Returns the encoding of feature :obj:`index` (of node type
+        :obj:`node_type` in heterogeneous graphs), resolving :obj:`"auto"`
+        based on the feature values in :obj:`column`.
         """
-        return _resolve_encoding(self.feature_encoding, self.feature_names,
-                                 index, column)
+        names = _select(self.feature_names, node_type)
+        return _resolve_encoding(self.feature_encoding, names, index, column,
+                                 per_type=node_type is not None)
 
     def edge_encoding(
         self,
         index: int,
         column: Optional[Tensor] = None,
+        relation: Optional[str] = None,
     ) -> str:
-        r"""Returns the encoding of edge feature :obj:`index`, resolving
-        :obj:`"auto"` based on the feature values in :obj:`column`.
+        r"""Returns the encoding of edge feature :obj:`index` (of relation
+        :obj:`relation` in heterogeneous graphs), resolving :obj:`"auto"`
+        based on the feature values in :obj:`column`.
         """
-        return _resolve_encoding(self.edge_feature_encoding,
-                                 self.edge_feature_names, index, column)
+        names = _select(self.edge_feature_names, relation)
+        return _resolve_encoding(self.edge_feature_encoding, names, index,
+                                 column, per_type=relation is not None)
 
     def excluded_classes(self) -> List[str]:
         r"""Returns the IRIs of all classes that concept learners must not
@@ -368,7 +464,67 @@ def to_owl_schema(
     return OWLSchema(**schema)
 
 
-class OWLData(Data):
+class _OWLMixin:
+    r"""The OWL-related attributes and methods shared by :class:`OWLData`
+    and :class:`OWLHeteroData`. The schema and source are stored outside of
+    the attribute storage, so that they are neither collated nor moved
+    across devices.
+    """
+    __dict__: Dict[str, Any]
+
+    def _init_owl(
+        self,
+        schema: Optional[Union[OWLSchema, Dict[str, Any]]],
+        source: Optional[str],
+    ) -> None:
+        self.__dict__['_schema'] = to_owl_schema(schema)
+        self.__dict__['_source'] = source
+
+    @property
+    def schema(self) -> OWLSchema:
+        r"""The :class:`OWLSchema` that maps the graph to OWL."""
+        if self.__dict__.get('_schema') is None:
+            self.__dict__['_schema'] = OWLSchema()
+        return self.__dict__['_schema']
+
+    @schema.setter
+    def schema(self, schema: Union[OWLSchema, Dict[str, Any]]) -> None:
+        self.__dict__['_schema'] = to_owl_schema(schema)
+
+    @property
+    def source(self) -> Optional[str]:
+        r"""The path of the OWL file the data was read from, if any."""
+        return self.__dict__.get('_source')
+
+    @source.setter
+    def source(self, source: Optional[str]) -> None:
+        self.__dict__['_source'] = source
+
+    def to_owl(self, **kwargs: Any) -> Any:
+        r"""Converts the data object to an OWL ontology given as an
+        :class:`rdflib.Graph`.
+        See :meth:`torch_geometric.utils.to_owl` for the arguments.
+        """
+        from torch_geometric.utils import to_owl
+        return to_owl(self, **kwargs)
+
+    def save_owl(self, path: str, format: str = 'xml', **kwargs: Any) -> str:
+        r"""Saves the data object as an OWL ontology and returns the path.
+
+        Args:
+            path (str): The file to write to.
+            format (str, optional): The :obj:`rdflib` serialization format.
+                :obj:`"xml"` (RDF/XML) can be read by every OWL tool.
+                (default: :obj:`"xml"`)
+            **kwargs (optional): Additional arguments of
+                :meth:`torch_geometric.utils.to_owl`.
+        """
+        path = osp.expanduser(path)
+        self.to_owl(**kwargs).serialize(destination=path, format=format)
+        return path
+
+
+class OWLData(_OWLMixin, Data):
     r"""A :class:`~torch_geometric.data.Data` object that is connected to an
     OWL ontology.
 
@@ -436,30 +592,7 @@ class OWLData(Data):
     ):
         super().__init__(x=x, edge_index=edge_index, edge_attr=edge_attr, y=y,
                          pos=pos, time=time, **kwargs)
-        # The schema and source are stored outside of the attribute storage,
-        # so that they are neither collated nor moved across devices:
-        self.__dict__['_schema'] = to_owl_schema(schema)
-        self.__dict__['_source'] = source
-
-    @property
-    def schema(self) -> OWLSchema:
-        r"""The :class:`OWLSchema` that maps the graph to OWL."""
-        if self.__dict__.get('_schema') is None:
-            self.__dict__['_schema'] = OWLSchema()
-        return self.__dict__['_schema']
-
-    @schema.setter
-    def schema(self, schema: Union[OWLSchema, Dict[str, Any]]) -> None:
-        self.__dict__['_schema'] = to_owl_schema(schema)
-
-    @property
-    def source(self) -> Optional[str]:
-        r"""The path of the OWL file the data was read from, if any."""
-        return self.__dict__.get('_source')
-
-    @source.setter
-    def source(self, source: Optional[str]) -> None:
-        self.__dict__['_source'] = source
+        self._init_owl(schema, source)
 
     @classmethod
     def from_owl(cls, source: Any, **kwargs: Any) -> 'OWLData':
@@ -467,7 +600,12 @@ class OWLData(Data):
         See :meth:`torch_geometric.utils.from_owl` for the arguments.
         """
         from torch_geometric.utils import from_owl
-        return from_owl(source, **kwargs)
+        if kwargs.get('node_types') is not None:
+            raise ValueError("Use 'OWLHeteroData.from_owl' to read "
+                             "heterogeneous graphs")
+        out = from_owl(source, **kwargs)
+        assert isinstance(out, OWLData)
+        return out
 
     @classmethod
     def from_data(
@@ -500,29 +638,6 @@ class OWLData(Data):
                 out.schema.node_iri(i) for i in range(out.num_nodes)
             ]
         return out
-
-    def to_owl(self, **kwargs: Any) -> Any:
-        r"""Converts the data object to an OWL ontology given as an
-        :class:`rdflib.Graph`.
-        See :meth:`torch_geometric.utils.to_owl` for the arguments.
-        """
-        from torch_geometric.utils import to_owl
-        return to_owl(self, **kwargs)
-
-    def save_owl(self, path: str, format: str = 'xml', **kwargs: Any) -> str:
-        r"""Saves the data object as an OWL ontology and returns the path.
-
-        Args:
-            path (str): The file to write to.
-            format (str, optional): The :obj:`rdflib` serialization format.
-                :obj:`"xml"` (RDF/XML) can be read by every OWL tool.
-                (default: :obj:`"xml"`)
-            **kwargs (optional): Additional arguments of
-                :meth:`torch_geometric.utils.to_owl`.
-        """
-        path = osp.expanduser(path)
-        self.to_owl(**kwargs).serialize(destination=path, format=format)
-        return path
 
     def index_of(self, iris: Union[str, Iterable[str]]) -> Tensor:
         r"""Returns the node indices of the individuals with the given IRIs.
@@ -565,3 +680,127 @@ class OWLData(Data):
         if mask_name is not None:
             self[mask_name] = y >= 0
         return self
+
+
+class OWLHeteroData(_OWLMixin, HeteroData):
+    r"""A :class:`~torch_geometric.data.HeteroData` object that is connected
+    to an OWL ontology, the heterogeneous counterpart of :class:`OWLData`.
+
+    Every node type corresponds to an OWL class, and every relation of an
+    edge type :obj:`(src, rel, dst)` to an object property (see
+    :class:`OWLSchema`). The IRIs of the nodes of every node type are stored
+    in the node-level attribute :obj:`node_iri`.
+
+    .. code-block:: python
+
+        from torch_geometric.data import OWLHeteroData, OWLSchema
+
+        # OWL -> PyG: The individuals of each class become one node type:
+        data = OWLHeteroData.from_owl('aifb.owl',
+                                      node_types=['Person', 'Publication'])
+
+        # PyG -> OWL:
+        data = OWLHeteroData.from_data(data, OWLSchema(
+            base_iri='http://example.org/dblp#',
+            feature_names={'paper': ['Theory', 'Systems']},
+        ))
+        data.save_owl('dblp.owl')
+
+    Args:
+        _mapping (Dict[str, Any], optional): A dictionary holding the node
+            and edge type attributes, see
+            :class:`~torch_geometric.data.HeteroData`. (default: :obj:`None`)
+        schema (OWLSchema or Dict[str, Any], optional): The schema that maps
+            the graph to OWL. (default: :obj:`None`)
+        source (str, optional): The path of the OWL file the data was read
+            from, if any. (default: :obj:`None`)
+        **kwargs (optional): Additional attributes.
+    """
+    def __init__(
+        self,
+        _mapping: Optional[Dict[str, Any]] = None,
+        schema: Optional[Union[OWLSchema, Dict[str, Any]]] = None,
+        source: Optional[str] = None,
+        **kwargs: Any,
+    ):
+        super().__init__(_mapping, **kwargs)
+        self._init_owl(schema, source)
+
+    def __setattr__(self, key: str, value: Any) -> None:
+        prop = getattr(self.__class__, key, None)
+        if isinstance(prop, property) and prop.fset is not None:
+            prop.fset(self, value)
+        else:
+            super().__setattr__(key, value)
+
+    @classmethod
+    def from_owl(
+        cls,
+        source: Any,
+        node_types: Sequence[str],
+        **kwargs: Any,
+    ) -> 'OWLHeteroData':
+        r"""Creates an :class:`OWLHeteroData` object from an OWL ontology.
+        See :meth:`torch_geometric.utils.from_owl` for the arguments.
+        """
+        from torch_geometric.utils import from_owl
+        out = from_owl(source, node_types=node_types, **kwargs)
+        assert isinstance(out, OWLHeteroData)
+        return out
+
+    @classmethod
+    def from_data(
+        cls,
+        data: HeteroData,
+        schema: Optional[Union[OWLSchema, Dict[str, Any]]] = None,
+    ) -> 'OWLHeteroData':
+        r"""Creates an :class:`OWLHeteroData` object from a
+        :class:`~torch_geometric.data.HeteroData` object.
+
+        Args:
+            data (torch_geometric.data.HeteroData): The input graph.
+            schema (OWLSchema or Dict[str, Any], optional): The schema that
+                maps the graph to OWL. If set to :obj:`None` and :obj:`data`
+                is an :class:`OWLHeteroData` object, its schema is reused.
+                (default: :obj:`None`)
+        """
+        if schema is None and isinstance(data, OWLHeteroData):
+            schema = data.schema
+        source = data.source if isinstance(data, OWLHeteroData) else None
+
+        out = cls(schema=schema, source=source)
+        for key, value in data._global_store.items():
+            out[key] = value
+        for node_type, store in data.node_items():
+            for key, value in store.items():
+                out[node_type][key] = value
+            num_nodes = store.num_nodes
+            if 'node_iri' not in out[node_type] and num_nodes is not None:
+                out[node_type].num_nodes = num_nodes
+                out[node_type].node_iri = [
+                    out.schema.node_iri(i, node_type) for i in range(num_nodes)
+                ]
+        for edge_type, store in data.edge_items():
+            for key, value in store.items():
+                out[edge_type][key] = value
+        return out
+
+    def index_of(
+        self,
+        iris: Union[str, Iterable[str]],
+        node_type: str,
+    ) -> Tensor:
+        r"""Returns the node indices of the individuals with the given IRIs.
+
+        Args:
+            iris (str or Iterable[str]): The IRI(s) of the individuals.
+            node_type (str): The node type of the individuals.
+        """
+        if isinstance(iris, str):
+            iris = [iris]
+        mapping = {iri: i for i, iri in enumerate(self[node_type].node_iri)}
+        missing = [iri for iri in iris if iri not in mapping]
+        if len(missing) > 0:
+            raise KeyError(f"Found {len(missing)} unknown individual(s) of "
+                           f"node type '{node_type}', e.g., '{missing[0]}'")
+        return torch.tensor([mapping[iri] for iri in iris], dtype=torch.long)

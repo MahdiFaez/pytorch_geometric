@@ -1,3 +1,5 @@
+import re
+
 import pytest
 import torch
 
@@ -709,3 +711,56 @@ def test_ontolearn_explainer_witness_edge_types():
     # Only the `next` assertion (and its inverse edge) is a witness edge:
     assert explanation.witness_mask.view(-1).tolist() == [0.0, 1.0]
     assert explanation.edge_mask.tolist() == [1.0, 0.0, 1.0]
+
+
+@withPackage('ontolearn', 'rdflib')
+@pytest.mark.parametrize('learner', ['EvoLearner', 'CELOE'])
+def test_ontolearn_explainer_card_limit(learner):
+    # Hubs 0 to 3 have 12 successors, hubs 4 to 7 have 11 successors. The
+    # planted concept `≥ 12 next.⊤` exceeds Ontolearn's default limit of 10:
+    row = torch.arange(8).repeat_interleave(torch.tensor([12] * 4 + [11] * 4))
+    col = torch.arange(8, 8 + row.numel())
+    num_nodes = 8 + row.numel()
+    y = torch.full((num_nodes, ), -1)
+    y[:4], y[4:8] = 1, 0
+    x = torch.ones(num_nodes, 1)
+    schema = OWLSchema(base_iri=BASE, relation_names=['next'],
+                       feature_names=['Thing'])
+
+    def explain(**kwargs):
+        algorithm = OntolearnExplainer(learner, schema=schema, **kwargs)
+        explainer = get_explainer(algorithm, model=ConstantModel())
+        return algorithm, explainer(x, torch.stack([row, col]), target=y,
+                                    index=0)
+
+    algorithm, explanation = explain(card_limit=15, max_runtime=2)
+    concept_learner = algorithm._concept_learner
+    if learner == 'EvoLearner':
+        assert concept_learner.card_limit == 15
+    else:
+        assert concept_learner.operator.card_limit == 15
+    # Learners may return any equivalent concept, e.g., `≥ 12 next.Thing` or
+    # `¬(≤ 11 next.Thing)`, but each needs a number larger than 10:
+    numbers = re.findall(r'[≥≤] (\d+)', explanation.concept)
+    assert max(int(number) for number in numbers) > 10
+    assert explanation.concept_accuracy == 1.0
+
+    # With the default limit, the hubs cannot be separated:
+    _, explanation = explain(max_runtime=1)
+    assert explanation.concept_accuracy < 1.0
+
+
+@withPackage('ontolearn')
+def test_ontolearn_explainer_card_limit_errors():
+    with pytest.raises(ValueError, match="needs to be positive"):
+        OntolearnExplainer(card_limit=0)
+    with pytest.raises(ValueError, match="already initialized learner"):
+        OntolearnExplainer(FixedLearner(None), card_limit=5)
+    with pytest.raises(ValueError, match="Pass either"):
+        OntolearnExplainer('CELOE', card_limit=5, refinement_operator=None)
+    with pytest.raises(ValueError, match="not supported for the learner"):
+        OntolearnExplainer(card_limit=5)._get_learner_kwargs(object, None)
+
+    # Without a limit, the learner's own arguments are passed as they are:
+    algorithm = OntolearnExplainer('CELOE', max_runtime=1)
+    assert algorithm._get_learner_kwargs(object, None) == dict(max_runtime=1)

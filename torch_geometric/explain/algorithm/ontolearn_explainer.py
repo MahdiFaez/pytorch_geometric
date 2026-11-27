@@ -245,6 +245,15 @@ class OntolearnExplainer(ExplainerAlgorithm):
         node_type (str, optional): The node type to explain in heterogeneous
             graphs. Can be omitted for graphs with a single node type.
             (default: :obj:`None`)
+        card_limit (int, optional): The largest number :obj:`n` the concept
+            learner uses in cardinality restrictions such as
+            :obj:`≥ n hasAtom.C`. For :obj:`"EvoLearner"`, it is passed as its
+            :obj:`card_limit`. For :obj:`"CELOE"` and :obj:`"OCEL"`, it is
+            passed to their refinement operator, which never uses a number
+            larger than the maximum number of fillers in the knowledge base.
+            If set to :obj:`None`, the learner's default is used (:obj:`10` in
+            Ontolearn), which truncates concepts that need larger numbers,
+            *e.g.*, molecule sizes. (default: :obj:`None`)
         **kwargs (optional): Additional arguments passed to the concept
             learner, *e.g.*, :obj:`max_runtime`.
     """
@@ -263,6 +272,7 @@ class OntolearnExplainer(ExplainerAlgorithm):
         balanced: bool = False,
         seed: Optional[int] = None,
         node_type: Optional[str] = None,
+        card_limit: Optional[int] = None,
         **kwargs: Any,
     ):
         super().__init__()
@@ -294,6 +304,16 @@ class OntolearnExplainer(ExplainerAlgorithm):
         if num_hypotheses < 1:
             raise ValueError(f"'num_hypotheses' needs to be positive (got "
                              f"{num_hypotheses})")
+        if card_limit is not None:
+            if card_limit < 1:
+                raise ValueError(f"'card_limit' needs to be positive (got "
+                                 f"{card_limit})")
+            if not isinstance(learner, (str, type)):
+                raise ValueError("'card_limit' cannot be applied to an "
+                                 "already initialized learner")
+            if 'refinement_operator' in kwargs:
+                raise ValueError("Pass either 'card_limit' or a "
+                                 "'refinement_operator'")
 
         self.learner = learner
         self.data: Optional[Union[OWLData, OWLHeteroData]] = data
@@ -307,6 +327,7 @@ class OntolearnExplainer(ExplainerAlgorithm):
         self.balanced = balanced
         self.seed = seed
         self.node_type = node_type
+        self.card_limit = card_limit
         self.learner_kwargs = kwargs
 
         self._tmp_dir: Any = None
@@ -645,11 +666,13 @@ class OntolearnExplainer(ExplainerAlgorithm):
                 import ontolearn.learners
                 cls = getattr(ontolearn.learners, self.learner)
             with _unique_primitive_names():
-                learner = cls(knowledge_base=kb, **self.learner_kwargs)
+                learner = cls(knowledge_base=kb,
+                              **self._get_learner_kwargs(cls, kb))
         elif isinstance(self.learner, type):
             with _unique_primitive_names():
-                learner = self.learner(knowledge_base=kb,
-                                       **self.learner_kwargs)
+                learner = self.learner(
+                    knowledge_base=kb,
+                    **self._get_learner_kwargs(self.learner, kb))
         else:  # An already initialized learner:
             learner = self.learner
             kb = getattr(learner, 'kb', kb)
@@ -660,6 +683,31 @@ class OntolearnExplainer(ExplainerAlgorithm):
         self._instance_cache = {}
         self._filler_cache = {}
         self._edge_endpoints = None
+
+    def _get_learner_kwargs(self, cls: type, kb: Any) -> Dict[str, Any]:
+        r"""Returns the arguments of learner :obj:`cls`, including
+        :obj:`card_limit`.
+        """
+        kwargs = dict(self.learner_kwargs)
+        if self.card_limit is None:
+            return kwargs
+
+        from ontolearn import base_concept_learner, refinement_operators
+        from ontolearn.concept_learner import EvoLearner
+
+        if issubclass(cls, EvoLearner):
+            kwargs['card_limit'] = self.card_limit
+        elif issubclass(cls,
+                        base_concept_learner.RefinementBasedConceptLearner):
+            # The default operator of CELOE and OCEL, with another limit:
+            operator = refinement_operators.ModifiedCELOERefinement
+            kwargs['refinement_operator'] = operator(
+                kb, max_child_length=kwargs.get('max_child_length') or 10,
+                card_limit=self.card_limit)
+        else:
+            raise ValueError(f"'card_limit' is not supported for the learner "
+                             f"'{cls.__name__}'")
+        return kwargs
 
     # Graph-level tasks #######################################################
 

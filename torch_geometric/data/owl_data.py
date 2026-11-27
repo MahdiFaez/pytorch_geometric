@@ -32,6 +32,8 @@ PYG_RELATION = PYG_NAMESPACE + 'relation'
 PYG_EDGE = PYG_NAMESPACE + 'Edge'
 PYG_HAS_OUTGOING_EDGE = PYG_NAMESPACE + 'hasOutgoingEdge'
 PYG_HAS_INCOMING_EDGE = PYG_NAMESPACE + 'hasIncomingEdge'
+PYG_GRAPH = PYG_NAMESPACE + 'Graph'
+PYG_HAS_NODE = PYG_NAMESPACE + 'hasNode'
 
 _ABSOLUTE_IRI = re.compile(r'^[A-Za-z][A-Za-z0-9+.-]*:[^\s]+$')
 
@@ -160,6 +162,14 @@ class OWLSchema(CastMixin):
     node types to names, and :obj:`relation_names` and
     :obj:`edge_feature_names` are dictionaries that map relations to names.
 
+    For datasets of many graphs (*e.g.*, molecules), all graphs are written
+    to one ontology, and every graph becomes an individual of class
+    :obj:`pyg:Graph` (and of :obj:`graph_class`, if given) that is linked to
+    its nodes via :obj:`pyg:hasNode`. Domain names such as :obj:`hasAtom`
+    are given via :obj:`has_node_name` and declared as a sub property of
+    :obj:`pyg:hasNode`. Graph labels then become concepts over graphs, *e.g.*,
+    :obj:`∃ hasAtom.(N ⊓ ∃ hasOutgoingEdge.DoubleBond)`.
+
     .. note::
 
         Ontolearn (via :obj:`owlapy`) only accepts IRIs that contain a
@@ -257,6 +267,24 @@ class OWLSchema(CastMixin):
         node_type_names (Dict[str, str], optional): Maps node types of
             heterogeneous graphs to the names of their OWL classes. Unlisted
             node types use the node type itself. (default: :obj:`None`)
+        graph_class (str, optional): An OWL class every graph of a graph
+            dataset is asserted to be an instance of, in addition to
+            :obj:`pyg:Graph`, *e.g.*, :obj:`"Molecule"`.
+            (default: :obj:`None`)
+        graph_names (List[str], optional): The names of the graph
+            individuals, one per graph. If set to :obj:`None`, graphs are
+            named :obj:`"graph_{i}"`. (default: :obj:`None`)
+        has_node_name (str, optional): The name of the object property that
+            links graphs to their nodes, *e.g.*, :obj:`"hasAtom"`. It is
+            declared as a sub property of :obj:`pyg:hasNode`. If set to
+            :obj:`None`, :obj:`pyg:hasNode` is used. (default: :obj:`None`)
+        graph_feature_names (List[str], optional): The names of the columns of
+            the graph-level features :obj:`data.graph_attr`. If set to
+            :obj:`None`, columns are named :obj:`"graph_feature_{j}"`.
+            (default: :obj:`None`)
+        graph_feature_encoding (str or List[str] or Dict[str, str], optional):
+            How each graph feature is encoded in OWL, analogous to
+            :obj:`feature_encoding`. (default: :obj:`"auto"`)
     """
     base_iri: str
     node_class: Optional[str]
@@ -275,6 +303,11 @@ class OWLSchema(CastMixin):
     edge_feature_encoding: Union[str, List[str], Dict[str, str]]
     reify_edges: Optional[bool]
     node_type_names: Optional[Dict[str, str]]
+    graph_class: Optional[str]
+    graph_names: Optional[List[str]]
+    has_node_name: Optional[str]
+    graph_feature_names: Optional[List[str]]
+    graph_feature_encoding: Union[str, List[str], Dict[str, str]]
 
     def __init__(
         self,
@@ -300,6 +333,12 @@ class OWLSchema(CastMixin):
                                                               str]] = 'auto',
         reify_edges: Optional[bool] = None,
         node_type_names: Optional[Dict[str, str]] = None,
+        graph_class: Optional[str] = None,
+        graph_names: Optional[Sequence[str]] = None,
+        has_node_name: Optional[str] = None,
+        graph_feature_names: Optional[Sequence[str]] = None,
+        graph_feature_encoding: Union[str, Sequence[str], Dict[str,
+                                                               str]] = 'auto',
     ):
         if not is_absolute_iri(base_iri):
             raise ValueError(f"'base_iri' needs to be an absolute IRI "
@@ -334,6 +373,11 @@ class OWLSchema(CastMixin):
         self.reify_edges = reify_edges
         self.node_type_names = (None if node_type_names is None else
                                 dict(node_type_names))
+        self.graph_class = graph_class
+        self.graph_names = _to_list(graph_names)
+        self.has_node_name = has_node_name
+        self.graph_feature_names = _to_list(graph_feature_names)
+        self.graph_feature_encoding = _check_encoding(graph_feature_encoding)
 
     def iri(self, name: str) -> str:
         r"""Returns the absolute IRI of :obj:`name`."""
@@ -410,6 +454,28 @@ class OWLSchema(CastMixin):
             return self.iri(f'{relation}_feature_{index}')
         return self.iri(f'edge_feature_{index}')
 
+    def graph_iri(self, index: int) -> str:
+        r"""Returns the IRI of the individual of graph :obj:`index`."""
+        if self.graph_names is not None:
+            return self.iri(self.graph_names[index])
+        return self.iri(f'graph_{index}')
+
+    def has_node_iri(self) -> str:
+        r"""Returns the IRI of the object property that links graphs to their
+        nodes.
+        """
+        if self.has_node_name is None:
+            return PYG_HAS_NODE
+        return self.iri(self.has_node_name)
+
+    def graph_feature_iri(self, index: int) -> str:
+        r"""Returns the IRI of the class or data property of graph feature
+        :obj:`index`.
+        """
+        if self.graph_feature_names is not None:
+            return self.iri(self.graph_feature_names[index])
+        return self.iri(f'graph_feature_{index}')
+
     def label_iri(self, label: int) -> str:
         r"""Returns the IRI of the OWL class of label :obj:`label`."""
         if self.label_names is not None:
@@ -443,6 +509,17 @@ class OWLSchema(CastMixin):
         names = _select(self.edge_feature_names, relation)
         return _resolve_encoding(self.edge_feature_encoding, names, index,
                                  column, per_type=relation is not None)
+
+    def graph_encoding(
+        self,
+        index: int,
+        column: Optional[Tensor] = None,
+    ) -> str:
+        r"""Returns the encoding of graph feature :obj:`index`, resolving
+        :obj:`"auto"` based on the feature values in :obj:`column`.
+        """
+        return _resolve_encoding(self.graph_feature_encoding,
+                                 self.graph_feature_names, index, column)
 
     def excluded_classes(self) -> List[str]:
         r"""Returns the IRIs of all classes that concept learners must not
@@ -603,6 +680,10 @@ class OWLData(_OWLMixin, Data):
         if kwargs.get('node_types') is not None:
             raise ValueError("Use 'OWLHeteroData.from_owl' to read "
                              "heterogeneous graphs")
+        if kwargs.get('graph_level'):
+            raise ValueError("Use 'from_owl(..., graph_level=True)' to read "
+                             "graph datasets (it returns a list of "
+                             "'OWLData' objects)")
         out = from_owl(source, **kwargs)
         assert isinstance(out, OWLData)
         return out

@@ -242,8 +242,9 @@ class _OWLWriter:
 
 
 def to_owl(
-    data: Union['torch_geometric.data.Data',
-                'torch_geometric.data.HeteroData'],
+    data: Union['torch_geometric.data.Data', 'torch_geometric.data.HeteroData',
+                Sequence['torch_geometric.data.Data'],
+                'torch_geometric.data.Dataset'],
     schema: SchemaType = None,
     ontology_iri: Optional[str] = None,
     annotate_order: bool = True,
@@ -278,6 +279,37 @@ def to_owl(
     :class:`~torch_geometric.transforms.ToUndirected`) are implied by their
     forward edge type and not written.
 
+    For graph datasets, given as a :class:`~torch_geometric.data.Batch`, a
+    list of :class:`~torch_geometric.data.Data` objects or a
+    :class:`~torch_geometric.data.Dataset`, all graphs are written to **one**
+    ontology, so that a concept learner learns one concept over all graphs:
+
+    * Every graph becomes an individual of class :obj:`pyg:Graph` (and of
+      :obj:`schema.graph_class`), named via :obj:`data.graph_iri` or the
+      schema.
+    * Every graph is linked to its nodes via :obj:`pyg:hasNode`, or via a
+      sub property of it named :obj:`schema.has_node_name`, *e.g.*,
+      :obj:`hasAtom`.
+    * Graph-level features :obj:`data.graph_attr` (one row per graph) become
+      classes or data properties of the graph individuals (encoded via
+      :obj:`schema.graph_feature_encoding`).
+    * Graph labels :obj:`data.y` are **not** added, unless
+      :obj:`schema.include_labels=True`, in which case they are asserted on
+      the graph individuals.
+
+    .. code-block:: python
+
+        from torch_geometric.datasets import TUDataset
+
+        dataset = TUDataset(root, name='MUTAG')
+        schema = OWLSchema(base_iri='http://example.org/mutag#',
+                           node_class='Atom', graph_class='Molecule',
+                           has_node_name='hasAtom',
+                           feature_names=['C', 'N', 'O', 'F', 'I', 'Cl', 'Br'],
+                           edge_feature_names=['Aromatic', 'Single', 'Double',
+                                               'Triple'])
+        graph = to_owl(dataset, schema)
+
     The result can be written to disk via :meth:`rdflib.Graph.serialize`.
 
     .. code-block:: python
@@ -292,13 +324,15 @@ def to_owl(
         graph.serialize('graph.owl', format='xml')
 
     Args:
-        data (torch_geometric.data.Data or torch_geometric.data.HeteroData):
-            The graph data object.
+        data (Data or HeteroData or List[Data] or Dataset): The graph data
+            object, or a graph dataset of
+            :class:`~torch_geometric.data.Data` objects (see above).
         schema (OWLSchema or Dict[str, Any], optional): The schema that maps
             the graph to OWL. If set to :obj:`None`, the schema of an
             :class:`~torch_geometric.data.OWLData` or
-            :class:`~torch_geometric.data.OWLHeteroData` object is used, or a
-            default schema otherwise. (default: :obj:`None`)
+            :class:`~torch_geometric.data.OWLHeteroData` object (or of the
+            first graph of a list) is used, or a default schema otherwise.
+            (default: :obj:`None`)
         ontology_iri (str, optional): The IRI of the ontology. If set to
             :obj:`None`, it is derived from :obj:`schema.base_iri`.
             (default: :obj:`None`)
@@ -309,22 +343,67 @@ def to_owl(
             order. Annotations have no logical meaning and are ignored by
             reasoners and concept learners. (default: :obj:`True`)
     """
-    from torch_geometric.data import HeteroData, OWLData, OWLHeteroData
+    from torch_geometric.data import (
+        Batch,
+        Data,
+        HeteroData,
+        OWLData,
+        OWLHeteroData,
+    )
     from torch_geometric.data.owl_data import to_owl_schema
 
-    if schema is None and isinstance(data, (OWLData, OWLHeteroData)):
-        schema = data.schema
+    graph_data: Union[Data, HeteroData]
+    if not isinstance(data, (Data, HeteroData)):  # A list or a `Dataset`:
+        data_list = list(data)
+        if len(data_list) == 0:
+            raise ValueError("Expected at least one graph")
+        if any(not isinstance(item, Data) for item in data_list):
+            raise ValueError("Expected a list of 'Data' objects (graph "
+                             "datasets of 'HeteroData' objects are not "
+                             "supported yet)")
+        if schema is None and isinstance(data_list[0], OWLData):
+            schema = data_list[0].schema
+        batch = Batch.from_data_list(data_list)
+        assert isinstance(batch, Data)
+        graph_data = batch
+    else:
+        graph_data = data
+        if schema is None and isinstance(data, (OWLData, OWLHeteroData)):
+            schema = data.schema
     owl_schema = to_owl_schema(schema)
     writer = _OWLWriter(owl_schema, ontology_iri, annotate_order)
 
-    if isinstance(data, HeteroData):
-        _hetero_to_owl(data, writer)
+    if isinstance(graph_data, HeteroData):
+        if isinstance(graph_data, Batch):
+            raise ValueError("Graph datasets of 'HeteroData' objects are not "
+                             "supported yet")
+        _hetero_to_owl(graph_data, writer)
         return writer.finish()
+
+    is_graph_level = isinstance(graph_data, Batch)
+    individuals = _homo_to_owl(graph_data, writer,
+                               node_labels=not is_graph_level)
+    if is_graph_level:
+        _graphs_to_owl(graph_data, writer, individuals)
+    return writer.finish()
+
+
+def _homo_to_owl(
+    data: 'torch_geometric.data.Data',
+    writer: _OWLWriter,
+    node_labels: bool,
+) -> List[Any]:
+    r"""Writes the nodes, edges and features of a homogeneous graph (or of all
+    graphs in a batch) and returns the node individuals.
+    """
+    owl_schema = writer.schema
 
     # Individuals #############################################################
     num_nodes = data.num_nodes or 0
     if 'node_iri' in data:
         node_iri = list(data.node_iri)
+        if len(node_iri) > 0 and isinstance(node_iri[0], (list, tuple)):
+            node_iri = [iri for iris in node_iri for iri in iris]  # Batched.
         if len(node_iri) != num_nodes:
             raise ValueError(f"Expected 'node_iri' to hold {num_nodes} IRIs "
                              f"(got {len(node_iri)})")
@@ -390,10 +469,64 @@ def to_owl(
                             owl_schema.encoding)
 
     # Labels ##################################################################
-    if owl_schema.include_labels and 'y' in data:
+    if node_labels and owl_schema.include_labels and 'y' in data:
         writer.add_labels(individuals, data.y)
 
-    return writer.finish()
+    return individuals
+
+
+def _graphs_to_owl(
+    data: 'torch_geometric.data.Data',  # A `Batch`.
+    writer: _OWLWriter,
+    individuals: List[Any],
+) -> None:
+    r"""Adds one :obj:`pyg:Graph` individual per graph in :obj:`data`, links
+    it to its nodes, and adds graph features and (optionally) graph labels.
+    """
+    from rdflib import URIRef
+    from rdflib.namespace import OWL, RDF, RDFS
+
+    from torch_geometric.data.owl_data import PYG_GRAPH, PYG_HAS_NODE
+
+    schema = writer.schema
+    num_graphs = data.num_graphs
+    if 'graph_iri' in data:
+        graph_iri = list(data.graph_iri)
+        if len(graph_iri) != num_graphs:
+            raise ValueError(f"Expected 'graph_iri' to hold {num_graphs} IRIs "
+                             f"(got {len(graph_iri)})")
+    else:
+        graph_iri = [schema.graph_iri(i) for i in range(num_graphs)]
+
+    classes = [writer.declare_class(PYG_GRAPH)]
+    if schema.graph_class is not None:
+        classes.append(writer.declare_class(schema.iri(schema.graph_class)))
+    graphs = writer.add_individuals(graph_iri, classes)
+
+    # Membership ##############################################################
+    has_node = URIRef(PYG_HAS_NODE)
+    writer.graph.add((has_node, RDF.type, OWL.ObjectProperty))
+    prop = URIRef(schema.has_node_iri())
+    if prop != has_node:
+        writer.graph.add((prop, RDF.type, OWL.ObjectProperty))
+        writer.graph.add((prop, RDFS.subPropertyOf, has_node))
+    assert isinstance(data.batch, Tensor)
+    for i, g in enumerate(data.batch.tolist()):
+        writer.graph.add((graphs[g], prop, individuals[i]))
+
+    # Graph features and labels ###############################################
+    graph_attr = data.graph_attr if 'graph_attr' in data else None
+    if isinstance(graph_attr, Tensor):
+        graph_attr = _as_matrix(graph_attr, 'graph_attr')
+        if graph_attr.size(0) != num_graphs:
+            raise ValueError(f"Expected 'graph_attr' to hold one row per "
+                             f"graph (got shape {tuple(graph_attr.size())})")
+        _check_names(schema.graph_feature_names, graph_attr, 'graph feature')
+        writer.add_features(graphs, graph_attr, schema.graph_feature_iri,
+                            schema.graph_encoding)
+
+    if schema.include_labels and 'y' in data:
+        writer.add_labels(graphs, data.y)
 
 
 def _hetero_to_owl(
@@ -833,8 +966,10 @@ def from_owl(
     add_inverse_edges: bool = True,
     node_types: Optional[Sequence[str]] = None,
     format: Optional[str] = None,
+    graph_level: bool = False,
 ) -> Union['torch_geometric.data.OWLData',
-           'torch_geometric.data.OWLHeteroData']:
+           'torch_geometric.data.OWLHeteroData',
+           List['torch_geometric.data.OWLData']]:
     r"""Converts an OWL ontology to a
     :class:`torch_geometric.data.OWLData` instance (or a
     :class:`torch_geometric.data.OWLHeteroData` instance if
@@ -869,6 +1004,21 @@ def from_owl(
     :class:`~torch_geometric.transforms.ToUndirected`. Individuals of none of
     the classes are dropped.
 
+    If :obj:`graph_level=True`, the ontology holds a graph dataset (as
+    written by :meth:`~torch_geometric.utils.to_owl`), and a list with one
+    :class:`~torch_geometric.data.OWLData` object per graph is returned:
+    every individual of class :obj:`pyg:Graph` (or of
+    :obj:`schema.graph_class`) becomes one graph, whose nodes are the
+    individuals it is linked to via :obj:`pyg:hasNode` (or a sub property of
+    it, or :obj:`schema.has_node_name`). Graph labels :obj:`data.y` are
+    derived from :obj:`target_classes` of the graph individuals, and their
+    other classes and data properties become graph features
+    :obj:`data.graph_attr`. Node and edge features are computed over all
+    graphs, so all graphs have the same feature columns. The graph IRI is
+    stored in :obj:`data.graph_iri`. The list can be batched via
+    :meth:`~torch_geometric.data.Batch.from_data_list` or a
+    :class:`~torch_geometric.loader.DataLoader`.
+
     No reasoning beyond the :obj:`rdfs:subClassOf` closure is performed.
     The discovered IRIs are stored in :obj:`data.schema`, so the conversion
     can be reversed via :meth:`torch_geometric.utils.to_owl`.
@@ -880,6 +1030,11 @@ def from_owl(
         data = from_owl('family.owl', target_classes=['Female'])
         # OWLData(x=[202, 17], edge_index=[2, 1296], edge_type=[1296],
         #         y=[202], node_iri=[202], num_nodes=202)
+
+        data_list = from_owl('mutag.owl', target_classes=['Mutagenic'],
+                             graph_level=True)
+        # [OWLData(x=[17, 7], edge_index=[2, 76], edge_type=[76],
+        #          edge_attr=[76, 4], y=[1], graph_iri='...', ...), ...]
 
         data = from_owl('aifb.owl', node_types=['Person', 'Publication'])
         # OWLHeteroData(
@@ -895,7 +1050,9 @@ def from_owl(
             an :class:`rdflib.Graph`.
         schema (OWLSchema or Dict[str, Any], optional): A schema whose
             :obj:`base_iri` is used to resolve local names, *e.g.*, in
-            :obj:`target_classes`. (default: :obj:`None`)
+            :obj:`target_classes`. For graph datasets, its
+            :obj:`graph_class` and :obj:`has_node_name` identify graphs that
+            are not instances of :obj:`pyg:Graph`. (default: :obj:`None`)
         target_classes (List[str], optional): The OWL classes that define
             node labels. A single class results in binary labels. Multiple
             classes result in multi-class labels, where nodes that belong to
@@ -918,9 +1075,15 @@ def from_owl(
         format (str, optional): The :obj:`rdflib` parser format. If set to
             :obj:`None`, it is guessed from the file extension, with
             :obj:`".owl"` files parsed as RDF/XML. (default: :obj:`None`)
+        graph_level (bool, optional): If set to :obj:`True`, reads a graph
+            dataset and returns one :class:`OWLData` object per graph (see
+            above). Then, :obj:`target_classes` define graph labels.
+            (default: :obj:`False`)
     """
-    from torch_geometric.data import OWLData, OWLSchema
-
+    if graph_level and node_types is not None:
+        raise ValueError("Graph datasets of heterogeneous graphs are not "
+                         "supported yet ('graph_level' and 'node_types' "
+                         "cannot be combined)")
     reader = _OWLReader(source, schema, format, features)
 
     # Target classes and their sub classes entail the label, and are thus
@@ -935,8 +1098,30 @@ def from_owl(
     if node_types is not None:
         return _hetero_from_owl(reader, node_types, targets, excluded,
                                 add_inverse_edges)
+    if graph_level:
+        return _graphs_from_owl(reader, targets, excluded, add_inverse_edges)
 
     nodes = reader.ordered(reader.individuals)
+    return _homo_from_owl(reader, nodes, targets, excluded, add_inverse_edges)
+
+
+def _homo_from_owl(
+    reader: _OWLReader,
+    nodes: List[Any],
+    targets: List[Any],
+    excluded: Set[Any],
+    add_inverse_edges: bool,
+    node_targets: Optional[List[Any]] = None,
+    **schema_kwargs: Any,
+) -> 'torch_geometric.data.OWLData':
+    r"""Converts :obj:`nodes` and the edges between them to an
+    :class:`~torch_geometric.data.OWLData` object. Node labels are derived
+    from :obj:`node_targets` (:obj:`targets` by default), and
+    :obj:`targets` is recorded in the schema.
+    """
+    from torch_geometric.data import OWLData, OWLSchema
+
+    node_targets = targets if node_targets is None else node_targets
     node_index = {node: i for i, node in enumerate(nodes)}
     num_nodes = len(nodes)
 
@@ -974,7 +1159,7 @@ def from_owl(
     types = reader.asserted_types(nodes)
     x, feature_names, feature_encoding = reader.get_features(
         nodes, types, excluded)
-    y = reader.get_labels(types, targets)
+    y = reader.get_labels(types, node_targets)
 
     out_schema = OWLSchema(
         base_iri=reader.schema.base_iri,
@@ -989,6 +1174,7 @@ def from_owl(
         edge_feature_names=edge_feature_names or None,
         edge_feature_encoding=edge_feature_encoding or 'auto',
         reify_edges=True if any(row[3] is not None for row in rows) else None,
+        **schema_kwargs,
     )
 
     data = OWLData(x=x, edge_index=edge_index, edge_type=edge_type,
@@ -997,6 +1183,134 @@ def from_owl(
     data.node_iri = [str(node) for node in nodes]
     data.num_nodes = num_nodes
     return data
+
+
+def _graphs_from_owl(
+    reader: _OWLReader,
+    targets: List[Any],
+    excluded: Set[Any],
+    add_inverse_edges: bool,
+) -> List['torch_geometric.data.OWLData']:
+    r"""Converts an ontology of many graphs to one
+    :class:`~torch_geometric.data.OWLData` object per graph individual.
+    """
+    from rdflib import URIRef
+    from rdflib.namespace import RDF, RDFS
+
+    from torch_geometric.data import OWLData
+    from torch_geometric.data.owl_data import PYG_GRAPH, PYG_HAS_NODE
+
+    graph, schema = reader.graph, reader.schema
+
+    # Membership properties: `pyg:hasNode` and its (transitive) sub properties,
+    # plus the property named in the schema:
+    has_node = URIRef(PYG_HAS_NODE)
+    props = set(graph.transitive_subjects(RDFS.subPropertyOf, has_node))
+    props.add(URIRef(schema.has_node_iri()))
+
+    # Graph individuals: instances of `pyg:Graph` or of `schema.graph_class`,
+    # and subjects of membership assertions:
+    graph_classes = set(
+        reader.resolve([schema.graph_class]) if schema.
+        graph_class is not None else [])
+    graphs = reader.uris(graph.subjects(RDF.type, URIRef(PYG_GRAPH)))
+    candidates = list(reader.individuals)
+    for node, types in zip(candidates, reader.asserted_types(candidates)):
+        if reader.closure(types) & graph_classes:
+            graphs.add(node)
+    for prop in props:
+        graphs |= reader.uris(graph.subjects(prop, None))
+    if len(graphs) == 0:
+        raise ValueError(f"Could not find any graph individual (expected "
+                         f"individuals of class '{PYG_GRAPH}' or graphs "
+                         f"linked to their nodes via '{PYG_HAS_NODE}')")
+
+    # Assign nodes to graphs ##################################################
+    node_candidates = reader.individuals - graphs
+    graph_of: Dict[Any, Any] = {}
+    for prop in props:
+        for subj, obj in graph.subject_objects(prop):
+            if subj not in graphs or obj not in node_candidates:
+                continue
+            if graph_of.get(obj, subj) != subj:
+                raise ValueError(f"Found the node '{obj}' in more than one "
+                                 f"graph ('{graph_of[obj]}' and '{subj}')")
+            graph_of[obj] = subj
+    num_dropped = len(node_candidates) - len(graph_of)
+    if num_dropped > 0:
+        warnings.warn(
+            f"Found {num_dropped} individual(s) that belong to no graph. "
+            f"They are dropped.", stacklevel=3)
+
+    graphs_ordered = reader.ordered(graphs)
+    members: Dict[Any, List[Any]] = {g: [] for g in graphs_ordered}
+    for node, g in graph_of.items():
+        members[g].append(node)
+    node_lists = [reader.ordered(members[g]) for g in graphs_ordered]
+    nodes = [node for node_list in node_lists for node in node_list]
+    counts = torch.tensor([len(node_list) for node_list in node_lists],
+                          dtype=torch.long)
+    ptr = torch.cat([torch.zeros(1, dtype=torch.long), counts.cumsum(0)])
+
+    # Graph features and labels ###############################################
+    graph_types = reader.asserted_types(graphs_ordered)
+    graph_attr, graph_feature_names, graph_feature_encoding = \
+        reader.get_features(graphs_ordered, graph_types,
+                            excluded | graph_classes)
+    y = reader.get_labels(graph_types, targets)
+
+    memberships = props - {has_node}
+    data = _homo_from_owl(
+        reader,
+        nodes,
+        targets,
+        excluded,
+        add_inverse_edges,
+        node_targets=[],
+        graph_class=(str(next(iter(graph_classes)))
+                     if len(graph_classes) == 1 else None),
+        has_node_name=(str(next(iter(memberships)))
+                       if len(memberships) == 1 else None),
+        graph_feature_names=graph_feature_names or None,
+        graph_feature_encoding=graph_feature_encoding or 'auto',
+    )
+
+    # Split the nodes and edges into graphs ###################################
+    batch = torch.repeat_interleave(counts)
+    edge_index, edge_type = data.edge_index, data.edge_type
+    assert isinstance(edge_index, Tensor) and isinstance(edge_type, Tensor)
+    x, edge_attr = data.x, data.edge_attr
+    if (batch[edge_index[0]] != batch[edge_index[1]]).any():
+        raise ValueError("Found edges between nodes of different graphs")
+    # Edges are sorted by source node, so the edges of each graph are
+    # contiguous:
+    edge_counts = torch.bincount(batch[edge_index[0]],
+                                 minlength=len(graphs_ordered))
+    edge_ptr = torch.cat(
+        [torch.zeros(1, dtype=torch.long),
+         edge_counts.cumsum(0)])
+
+    out: List[OWLData] = []
+    for g, graph_individual in enumerate(graphs_ordered):
+        start, end = int(ptr[g]), int(ptr[g + 1])
+        edge_start, edge_end = int(edge_ptr[g]), int(edge_ptr[g + 1])
+        item = OWLData(
+            x=None if x is None else x[start:end],
+            edge_index=edge_index[:, edge_start:edge_end] - start,
+            edge_type=edge_type[edge_start:edge_end],
+            edge_attr=(None if edge_attr is None else
+                       edge_attr[edge_start:edge_end]),
+            y=None if y is None else y[g:g + 1],
+            schema=data.schema,
+            source=data.source,
+        )
+        if graph_attr is not None:
+            item.graph_attr = graph_attr[g:g + 1]
+        item.node_iri = data.node_iri[start:end]
+        item.graph_iri = str(graph_individual)
+        item.num_nodes = end - start
+        out.append(item)
+    return out
 
 
 def _unique_names(entities: List[Any]) -> Dict[Any, str]:

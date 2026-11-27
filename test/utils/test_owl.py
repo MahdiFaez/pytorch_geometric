@@ -429,3 +429,202 @@ def test_hetero_from_owl():
         from_owl(graph, node_types=['author', 'Thing', 'paper'])
     with pytest.raises(ValueError, match="duplicated node types"):
         from_owl(graph, node_types=['author', 'author'])
+
+
+def get_graph_dataset() -> list:
+    # Two "molecules": C-N-C with a double bond C=N, and a single N atom.
+    g1 = Data(
+        x=torch.tensor([[1.0, 0.0], [0.0, 1.0], [1.0, 0.0]]),
+        edge_index=torch.tensor([[0, 1, 1, 2], [1, 0, 2, 1]]),
+        edge_attr=torch.tensor([[1.0], [1.0], [0.0], [0.0]]),
+        graph_attr=torch.tensor([[2.5]]),
+        y=torch.tensor([1]),
+    )
+    g2 = Data(
+        x=torch.tensor([[0.0, 1.0]]),
+        edge_index=torch.empty((2, 0), dtype=torch.long),
+        edge_attr=torch.empty((0, 1)),
+        graph_attr=torch.tensor([[1.0]]),
+        y=torch.tensor([0]),
+    )
+    return [g1, g2]
+
+
+def get_graph_schema(**kwargs) -> OWLSchema:
+    return OWLSchema(
+        base_iri=BASE,
+        node_class='Atom',
+        graph_class='Molecule',
+        has_node_name='hasAtom',
+        feature_names=['C', 'N'],
+        edge_feature_names=['Double'],
+        graph_feature_names=['logP'],
+        label_names=['Inactive', 'Active'],
+        **kwargs,
+    )
+
+
+@withPackage('rdflib')
+def test_graph_dataset_to_owl():
+    from rdflib import Literal, URIRef
+    from rdflib.namespace import OWL, RDF, RDFS, XSD
+
+    from torch_geometric.data.owl_data import PYG_GRAPH, PYG_HAS_NODE
+
+    def iri(name: str) -> URIRef:
+        return URIRef(BASE + name)
+
+    graph = to_owl(get_graph_dataset(), get_graph_schema())
+
+    # Every graph is an individual linked to its nodes:
+    for name in ['graph_0', 'graph_1']:
+        assert (iri(name), RDF.type, URIRef(PYG_GRAPH)) in graph
+        assert (iri(name), RDF.type, iri('Molecule')) in graph
+    assert (iri('hasAtom'), RDF.type, OWL.ObjectProperty) in graph
+    assert (iri('hasAtom'), RDFS.subPropertyOf, URIRef(PYG_HAS_NODE)) in graph
+    members = {(str(s), str(o))
+               for s, o in graph.subject_objects(iri('hasAtom'))}
+    assert members == {(BASE + 'graph_0', BASE + f'node_{i}')
+                       for i in range(3)
+                       } | {(BASE + 'graph_1', BASE + 'node_3')}
+
+    # Node offsets are applied, and nodes and edges are converted as usual:
+    assert (iri('node_3'), RDF.type, iri('N')) in graph
+    assert (iri('node_1'), RDF.type, iri('Atom')) in graph
+    assert (iri('node_2'), iri('related_to'), iri('node_1')) in graph
+    assert (iri('edge_0'), RDF.type, iri('Double')) in graph
+
+    # Graph features are asserted on the graph individuals:
+    assert (iri('graph_0'), iri('logP'), Literal(2.5,
+                                                 datatype=XSD.double)) in graph
+
+    # Graph labels are not added by default, and only on graphs otherwise:
+    assert (iri('Active'), RDF.type, OWL.Class) not in graph
+    graph = to_owl(get_graph_dataset(), get_graph_schema(include_labels=True))
+    assert (iri('graph_0'), RDF.type, iri('Active')) in graph
+    assert (iri('graph_1'), RDF.type, iri('Inactive')) in graph
+    assert not any(
+        (iri(f'node_{i}'), RDF.type, iri('Active')) in graph for i in range(4))
+
+    # Without a name, graphs are linked via `pyg:hasNode`:
+    graph = to_owl(get_graph_dataset(), OWLSchema(base_iri=BASE))
+    assert (iri('graph_1'), URIRef(PYG_HAS_NODE), iri('node_3')) in graph
+    assert (None, RDFS.subPropertyOf, None) not in graph
+
+
+@withPackage('rdflib')
+def test_graph_dataset_inputs():
+    from torch_geometric.data import Batch
+
+    data_list = get_graph_dataset()
+    schema = get_graph_schema()
+    expected = len(to_owl(data_list, schema))
+
+    # A batch, a tuple and a list of `OWLData` (whose schema is used) give
+    # the same ontology:
+    assert len(to_owl(Batch.from_data_list(data_list), schema)) == expected
+    assert len(to_owl(tuple(data_list), schema)) == expected
+    owl_list = [OWLData.from_data(data, schema) for data in data_list]
+    for i, data in enumerate(owl_list):
+        data.node_iri = [f'{BASE}m{i}_{j}' for j in range(data.num_nodes)]
+        data.graph_iri = f'{BASE}m{i}'
+    graph = to_owl(owl_list)
+    assert len(graph) == expected
+    out = from_owl(graph, schema=OWLSchema(base_iri=BASE), graph_level=True)
+    assert [data.graph_iri for data in out] == [BASE + 'm0', BASE + 'm1']
+    assert out[0].node_iri == [BASE + f'm0_{j}' for j in range(3)]
+
+    with pytest.raises(ValueError, match="at least one graph"):
+        to_owl([], schema)
+    with pytest.raises(ValueError, match="'graph_iri' to hold 2 IRIs"):
+        batch = Batch.from_data_list(data_list)
+        batch.graph_iri = [BASE + 'm0']
+        to_owl(batch, schema)
+    with pytest.raises(ValueError, match="Expected 1 graph feature names"):
+        schema = get_graph_schema()
+        schema.graph_feature_names = ['a', 'b']
+        to_owl(data_list, schema)
+
+
+@withPackage('rdflib')
+def test_graph_dataset_round_trip():
+    from torch_geometric.data import Batch
+
+    data_list = get_graph_dataset()
+    graph = to_owl(data_list, get_graph_schema(include_labels=True))
+    schema = OWLSchema(base_iri=BASE, graph_class='Molecule')
+    out = from_owl(graph, schema=schema, target_classes=['Active'],
+                   ignore_classes=['Inactive', 'Atom'], graph_level=True,
+                   add_inverse_edges=False)
+    assert [item.y.tolist() for item in out] == [[1], [0]]
+
+    # Converting twice is lossless (labels are not written back):
+    out = from_owl(to_owl(out), schema=schema, graph_level=True,
+                   add_inverse_edges=False)
+
+    assert len(out) == 2
+    for data, item in zip(data_list, out):
+        assert isinstance(item, OWLData)
+        assert 'y' not in item
+        assert torch.equal(item.x, data.x)
+        assert torch.equal(item.graph_attr, data.graph_attr)
+        edges = torch.cat([data.edge_index, data.edge_attr.t()]).t().tolist()
+        out_edges = torch.cat([item.edge_index, item.edge_attr.t()]).t()
+        assert sorted(out_edges.tolist()) == sorted(edges)
+    assert out[0].graph_iri == BASE + 'graph_0'
+    assert out[1].node_iri == [BASE + 'node_3']
+
+    schema = out[0].schema
+    assert schema.graph_class == BASE + 'Molecule'
+    assert schema.has_node_name == BASE + 'hasAtom'
+    assert schema.feature_names == [BASE + 'C', BASE + 'N']
+    assert schema.graph_feature_names == [BASE + 'logP']
+
+    batch = Batch.from_data_list(out)
+    assert batch.num_graphs == 2 and batch.x.size() == (4, 2)
+    assert batch.graph_iri == [BASE + 'graph_0', BASE + 'graph_1']
+
+
+@withPackage('rdflib')
+def test_from_owl_graph_level_errors():
+    from rdflib import URIRef
+    from rdflib.namespace import RDF
+
+    from torch_geometric.data.owl_data import PYG_GRAPH, PYG_HAS_NODE
+
+    def iri(name: str) -> URIRef:
+        return URIRef(BASE + name)
+
+    graph = to_owl(get_graph_dataset(), OWLSchema(base_iri=BASE))
+    with pytest.raises(ValueError, match="cannot be combined"):
+        from_owl(graph, graph_level=True, node_types=['Node'])
+    with pytest.raises(ValueError, match="graph_level=True"):
+        OWLData.from_owl(graph, graph_level=True)
+
+    with pytest.raises(ValueError, match="Could not find any graph"):
+        from_owl(to_owl(get_data(), get_schema()), graph_level=True)
+
+    # Nodes that belong to no graph are dropped:
+    graph.add((iri('lonely'), RDF.type, iri('Node')))
+    with pytest.warns(UserWarning, match="1 individual"):
+        out = from_owl(graph, graph_level=True)
+    assert sum(data.num_nodes for data in out) == 4
+
+    # A node in two graphs:
+    graph.add((iri('graph_1'), URIRef(PYG_HAS_NODE), iri('node_0')))
+    with pytest.raises(ValueError, match="more than one graph"):
+        from_owl(graph, graph_level=True)
+
+    # An edge between two graphs:
+    graph = to_owl(get_graph_dataset(), OWLSchema(base_iri=BASE))
+    graph.add((iri('node_0'), iri('related_to'), iri('node_3')))
+    with pytest.raises(ValueError, match="different graphs"):
+        from_owl(graph, graph_level=True)
+
+    # Graphs without `pyg:Graph` are found via the schema:
+    graph = to_owl(get_graph_dataset(), get_graph_schema())
+    graph.remove((None, RDF.type, URIRef(PYG_GRAPH)))
+    out = from_owl(graph, schema=OWLSchema(base_iri=BASE,
+                                           graph_class='Molecule'),
+                   graph_level=True)
+    assert [data.num_nodes for data in out] == [3, 1]

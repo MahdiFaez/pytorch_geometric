@@ -5,12 +5,23 @@ import os.path as osp
 import tempfile
 from collections import defaultdict
 from enum import Enum
-from typing import Any, Dict, Iterator, List, Optional, Sequence, Tuple, Union
+from typing import (
+    Any,
+    Dict,
+    Iterator,
+    List,
+    Optional,
+    Sequence,
+    Set,
+    Tuple,
+    Union,
+)
 
 import torch
 from torch import Tensor
 
 from torch_geometric.data import (
+    Batch,
     Data,
     HeteroData,
     OWLData,
@@ -18,6 +29,9 @@ from torch_geometric.data import (
     OWLSchema,
 )
 from torch_geometric.data.owl_data import (
+    PYG_HAS_INCOMING_EDGE,
+    PYG_HAS_NODE,
+    PYG_HAS_OUTGOING_EDGE,
     is_absolute_iri,
     local_name,
     to_owl_schema,
@@ -141,12 +155,41 @@ class OntolearnExplainer(ExplainerAlgorithm):
     :class:`~torch_geometric.explain.HeteroExplanation` holds one
     :obj:`node_mask` per node type.
 
+    For graph-level tasks (:obj:`task_level="graph"`), the inputs are a
+    batch of graphs (passing :obj:`batch` to the explainer), and all graphs
+    are converted to one ontology in which every graph is an individual of
+    :obj:`pyg:Graph` (see :meth:`~torch_geometric.utils.to_owl`). The graphs
+    of the explained class are positive examples, all other graphs negative
+    examples, so the concept describes graphs, *e.g.*,
+    :obj:`∃ hasAtom.(N ⊓ ∃ hasOutgoingEdge.Double)`. :obj:`index`,
+    :obj:`example_index` and :obj:`target_class` then refer to graphs, and
+    :obj:`data` can be a graph dataset (*e.g.*, the list returned by
+    :meth:`~torch_geometric.utils.from_owl` with :obj:`graph_level=True`).
+    The returned :class:`~torch_geometric.explain.Explanation` holds
+
+    * :obj:`graph_mask`: A :obj:`[num_graphs, 1]` mask that is :obj:`1` for
+      all graphs that are instances of :obj:`concept`, *i.e.*, the decision of
+      the concept for every graph.
+    * :obj:`concept_agreement`: A boolean :obj:`[num_graphs]` vector that is
+      :obj:`True` where the decision of the concept agrees with
+      :obj:`target`, *i.e.*, where the concept is a faithful explanation of
+      the graph's (predicted) class.
+    * :obj:`node_mask`: A :obj:`[num_nodes, 1]` mask of the *witnesses* of
+      :obj:`concept`, *i.e.*, the nodes that make a graph an instance of the
+      concept. For :obj:`∃ hasAtom.(N ⊓ ∃ bond.O)`, these are the nitrogen
+      atoms bonded to an oxygen atom, and those oxygen atoms. Negated parts
+      (:obj:`¬`) and upper bounds (:obj:`≤ n`) have no witnesses.
+    * :obj:`edge_mask` (if :obj:`edge_mask_type="object"`): A
+      :obj:`[num_edges]` mask of the edges that the witnesses are connected
+      by, or whose (reified) edge individuals are witnesses.
+
     .. note::
 
         This explainer requires the :obj:`ontolearn` package.
         Concept learners explain a class globally, *i.e.*, the explanation is
-        shared by all nodes of that class. If :obj:`index` is given, the class
-        of the nodes in :obj:`index` is explained.
+        shared by all nodes (or graphs) of that class. If :obj:`index` is
+        given, the class of the nodes (or graphs) in :obj:`index` is
+        explained.
 
     Args:
         learner (str or type or Any, optional): The concept learner to use.
@@ -155,9 +198,10 @@ class OntolearnExplainer(ExplainerAlgorithm):
             already initialized learner instance (which then needs to be
             bound to a knowledge base of the same graph).
             (default: :obj:`"EvoLearner"`)
-        data (OWLData or OWLHeteroData, optional): The graph to explain. If
-            it was read from an OWL file, the original ontology is used,
-            including its full TBox.
+        data (OWLData or OWLHeteroData or List[Data], optional): The graph to
+            explain, or the graph dataset to explain for graph-level tasks
+            (in the order of the input batch). If it was read from an OWL
+            file, the original ontology is used, including its full TBox.
             If set to :obj:`None`, an ontology is derived from the inputs of
             the explainer and :obj:`schema`. (default: :obj:`None`)
         schema (OWLSchema or Dict[str, Any], optional): The schema used to
@@ -171,9 +215,10 @@ class OntolearnExplainer(ExplainerAlgorithm):
             (default: :obj:`None`)
         num_hypotheses (int, optional): The number of class expressions to
             return. (default: :obj:`3`)
-        example_index (torch.Tensor, optional): The nodes (indices or a boolean
-            mask) used as examples of the learning problem. If set to
-            :obj:`None`, all labeled nodes are used. (default: :obj:`None`)
+        example_index (torch.Tensor, optional): The nodes (or graphs, for
+            graph-level tasks), given as indices or a boolean mask, used as
+            examples of the learning problem. If set to :obj:`None`, all
+            labeled nodes (or graphs) are used. (default: :obj:`None`)
         max_examples (int, optional): If set, samples at most this many
             positive and negative examples each. (default: :obj:`None`)
         balanced (bool, optional): If set to :obj:`True`, samples the same
@@ -191,7 +236,7 @@ class OntolearnExplainer(ExplainerAlgorithm):
     def __init__(
         self,
         learner: Union[str, Any] = 'EvoLearner',
-        data: Optional[Union[Data, HeteroData]] = None,
+        data: Optional[Union[Data, HeteroData, Sequence[Data]]] = None,
         schema: Optional[Union[OWLSchema, Dict[str, Any]]] = None,
         ignore_classes: Optional[Sequence[str]] = None,
         target_class: Optional[int] = None,
@@ -212,17 +257,30 @@ class OntolearnExplainer(ExplainerAlgorithm):
                                  f"support the learner '{learner}' (expected "
                                  f"one of {self.SUPPORTED_LEARNERS})")
             learner = names[learner.lower()]
-        if isinstance(data, HeteroData):
+        graph_data: Optional[List[Data]] = None
+        if isinstance(data, Batch):
+            graph_data = data.to_data_list()  # type: ignore
+            data = None
+        elif isinstance(data, HeteroData):
             if not isinstance(data, OWLHeteroData):
                 data = OWLHeteroData.from_data(data, schema)
-        elif data is not None and not isinstance(data, OWLData):
-            data = OWLData.from_data(data, schema)
+        elif isinstance(data, Data):
+            if not isinstance(data, OWLData):
+                data = OWLData.from_data(data, schema)
+        elif data is not None:  # A graph dataset:
+            graph_data = list(data)
+            if len(graph_data) == 0 or any(not isinstance(item, Data)
+                                           for item in graph_data):
+                raise ValueError("Expected 'data' to be a non-empty list of "
+                                 "'Data' objects for graph datasets")
+            data = None
         if num_hypotheses < 1:
             raise ValueError(f"'num_hypotheses' needs to be positive (got "
                              f"{num_hypotheses})")
 
         self.learner = learner
-        self.data = data
+        self.data: Optional[Union[OWLData, OWLHeteroData]] = data
+        self.graph_data = graph_data
         self.schema = None if schema is None else to_owl_schema(schema)
         self.ignore_classes = list(ignore_classes or [])
         self.target_class = target_class
@@ -238,11 +296,17 @@ class OntolearnExplainer(ExplainerAlgorithm):
         self._kb_key: Optional[Tuple[Any, ...]] = None
         self._kb: Any = None
         self._concept_learner: Any = None
-        # The IRIs of the explained nodes, and the node type and index of
-        # every individual (with node type `None` in homogeneous graphs):
-        self._node_iri: List[str] = []
+        # The IRIs of the explained nodes (or graphs), and the node type and
+        # index of every individual (with node type `None` in homogeneous
+        # graphs, and the graph index for graph-level tasks):
+        self._example_iri: List[str] = []
         self._iri_index: Dict[str, Tuple[Optional[str], int]] = {}
+        # The IRIs of the nodes of a batch of graphs (for witnesses):
+        self._node_iri: List[str] = []
         self._cache: Dict[Tuple[Any, ...], Dict[str, Any]] = {}
+        self._instance_cache: Dict[Any, Set[str]] = {}
+        self._filler_cache: Dict[Tuple[str, Any], List[str]] = {}
+        self._edge_endpoints: Optional[Dict[str, Tuple[str, str]]] = None
 
     def forward(
         self,
@@ -254,6 +318,9 @@ class OntolearnExplainer(ExplainerAlgorithm):
         index: Optional[Union[int, Tensor]] = None,
         **kwargs: Any,
     ) -> Union[Explanation, HeteroExplanation]:
+        if self.model_config.task_level == ModelTaskLevel.graph:
+            return self._forward_graph(x, edge_index, target, index, kwargs)
+
         node_type = self._get_node_type(x)
         if isinstance(x, dict):
             num_nodes = x[node_type].size(0)
@@ -307,9 +374,9 @@ class OntolearnExplainer(ExplainerAlgorithm):
 
     def supports(self) -> bool:
         task_level = self.model_config.task_level
-        if task_level != ModelTaskLevel.node:
+        if task_level not in {ModelTaskLevel.node, ModelTaskLevel.graph}:
             logging.error(f"'{self.__class__.__name__}' only supports "
-                          f"node-level explanations "
+                          f"node-level and graph-level explanations "
                           f"got (`task_level={task_level.value}`)")
             return False
 
@@ -330,10 +397,12 @@ class OntolearnExplainer(ExplainerAlgorithm):
                           f"got (`node_mask_type={value}`)")
             return False
 
+        # Edge masks (which can only be of type 'object') hold the edges of
+        # witnesses of graph-level concepts:
         edge_mask_type = self.explainer_config.edge_mask_type
-        if edge_mask_type is not None:
+        if task_level == ModelTaskLevel.node and edge_mask_type is not None:
             logging.error(f"'{self.__class__.__name__}' does not support "
-                          f"edge masks got "
+                          f"edge masks for node-level explanations got "
                           f"(`edge_mask_type={edge_mask_type.value}`)")
             return False
 
@@ -403,13 +472,6 @@ class OntolearnExplainer(ExplainerAlgorithm):
         if key == self._kb_key:
             return
 
-        try:
-            from ontolearn.knowledge_base import KnowledgeBase
-        except ImportError as e:
-            raise ImportError(f"'{self.__class__.__name__}' requires the "
-                              f"'ontolearn' package (install it via "
-                              f"`pip install ontolearn`)") from e
-
         data: Union[OWLData, OWLHeteroData, None] = self.data
         if data is None and isinstance(x, dict):
             assert isinstance(edge_index, dict)
@@ -439,17 +501,41 @@ class OntolearnExplainer(ExplainerAlgorithm):
             iri_index = {iri: (None, i) for i, iri in enumerate(data.node_iri)}
             node_iri = list(data.node_iri)
 
+        self._load_knowledge_base(data.source, data.save_owl, data.schema,
+                                  list(iri_index.keys()))
+        self._example_iri = node_iri
+        self._iri_index = iri_index
+        self._kb_key = key
+
+    def _load_knowledge_base(
+        self,
+        source: Optional[str],
+        save: Any,
+        schema: OWLSchema,
+        iris: List[str],
+    ) -> None:
+        r"""Loads the knowledge base from :obj:`source` (or from the file
+        written by :obj:`save(path)` if :obj:`source` does not exist), and
+        initializes the concept learner.
+        """
+        try:
+            from ontolearn.knowledge_base import KnowledgeBase
+        except ImportError as e:
+            raise ImportError(f"'{self.__class__.__name__}' requires the "
+                              f"'ontolearn' package (install it via "
+                              f"`pip install ontolearn`)") from e
+
         # `owlapy` rejects IRIs without a "/", *e.g.*, "urn:" IRIs:
-        invalid = [iri for iri in iri_index.keys() if '/' not in iri]
+        invalid = [iri for iri in iris if '/' not in iri]
         if len(invalid) > 0:
             raise ValueError(f"Ontolearn only supports IRIs that contain a "
                              f"'/' (got '{invalid[0]}'). Use an 'http(s)' "
                              f"IRI as 'base_iri' of the schema instead.")
 
-        path = data.source
+        path = source
         if path is None or not osp.exists(path):
             self._tmp_dir = tempfile.TemporaryDirectory()
-            path = data.save_owl(osp.join(self._tmp_dir.name, 'graph.owl'))
+            path = save(osp.join(self._tmp_dir.name, 'graph.owl'))
 
         with contextlib.redirect_stdout(io.StringIO()):
             kb = KnowledgeBase(path=osp.abspath(path))
@@ -462,19 +548,31 @@ class OntolearnExplainer(ExplainerAlgorithm):
             by_name[local_name(iri)].append(concept)
 
         ignored = set()
-        names = data.schema.excluded_classes() + self.ignore_classes
+        names = schema.excluded_classes() + self.ignore_classes
         for name in names:
             if name in concepts:
                 ignored.add(concepts[name])
-            elif data.schema.iri(name) in concepts:
-                ignored.add(concepts[data.schema.iri(name)])
+            elif schema.iri(name) in concepts:
+                ignored.add(concepts[schema.iri(name)])
             elif not is_absolute_iri(name) and len(by_name[name]) == 1:
                 ignored.add(by_name[name][0])
             elif name in self.ignore_classes:
                 raise ValueError(f"Could not find the OWL class '{name}' in "
                                  f"the knowledge base")
-        if len(ignored) > 0:
-            kb = kb.ignore_and_copy(ignored_classes=ignored)
+        # `pyg:hasNode` holds no assertions if graphs are linked to their
+        # nodes via a sub property (*e.g.*, `hasAtom`), and the structural
+        # reasoner of Ontolearn does not infer them. Then, it is removed so
+        # that the concept learner does not search over it:
+        from owlapy.class_expression import OWLObjectSomeValuesFrom, OWLThing
+        ignored_properties = [
+            prop for prop in kb.get_object_properties()
+            if prop.str == PYG_HAS_NODE and kb.individuals_count(
+                OWLObjectSomeValuesFrom(prop, OWLThing)) == 0
+        ]
+        if len(ignored) > 0 or len(ignored_properties) > 0:
+            kb = kb.ignore_and_copy(
+                ignored_classes=ignored or None,
+                ignored_object_properties=ignored_properties or None)
 
         if isinstance(self.learner, str):
             if self.learner == 'EvoLearner':
@@ -493,10 +591,321 @@ class OntolearnExplainer(ExplainerAlgorithm):
             kb = getattr(learner, 'kb', kb)
 
         self._kb, self._concept_learner = kb, learner
-        self._node_iri = node_iri
-        self._iri_index = iri_index
-        self._kb_key = key
         self._cache = {}
+        self._instance_cache = {}
+        self._filler_cache = {}
+        self._edge_endpoints = None
+
+    # Graph-level tasks #######################################################
+
+    def _forward_graph(
+        self,
+        x: Union[Tensor, Dict[str, Tensor]],
+        edge_index: Union[Tensor, Dict[Any, Tensor]],
+        target: Tensor,
+        index: Optional[Union[int, Tensor]],
+        kwargs: Dict[str, Any],
+    ) -> Explanation:
+        r"""Explains the graphs of a batch, see the class documentation."""
+        if isinstance(x, dict) or isinstance(edge_index, dict):
+            raise ValueError(f"'{self.__class__.__name__}' does not support "
+                             f"graph-level explanations of heterogeneous "
+                             f"graphs yet")
+        batch = kwargs.get('batch')
+        if batch is None:
+            batch = torch.zeros(x.size(0), dtype=torch.long)
+        batch = batch.detach().cpu().view(-1)
+        if batch.numel() != x.size(0):
+            raise ValueError(f"Expected 'batch' to hold one entry per node "
+                             f"(got {batch.numel()} entries for {x.size(0)} "
+                             f"nodes)")
+
+        if target.dim() > 1:
+            target = target.view(-1) if target.size(-1) == 1 else target
+        num_graphs = target.numel()
+        if target.dim() != 1 or (batch.numel() > 0
+                                 and int(batch.max()) >= num_graphs):
+            raise ValueError(f"Expected one target per graph (got a target "
+                             f"of shape {tuple(target.size())})")
+        target = target.detach().cpu().long()
+
+        self._prepare_graph_knowledge_base(x, edge_index, batch, num_graphs,
+                                           kwargs)
+        cls = self._get_class(target, index)
+        pos, neg = self._get_examples(target, cls)
+
+        key = (cls, tuple(pos.tolist()), tuple(neg.tolist()))
+        if key not in self._cache:
+            self._cache[key] = self._learn(pos, neg)
+        result = self._cache[key]
+
+        members = result['members'].get(None)
+        if members is None:
+            members = torch.empty(0, dtype=torch.long)
+        graph_mask = torch.zeros(num_graphs, 1)
+        graph_mask[members] = 1.0
+
+        # Witnesses are computed once per concept and batch:
+        if 'witnesses' not in result:
+            result['witnesses'] = self._get_witnesses(
+                result['class_expressions'][0], members)
+        individuals, pairs = result['witnesses']
+
+        node_mask = torch.zeros(x.size(0), 1)
+        node_index = {iri: i for i, iri in enumerate(self._node_iri)}
+        witness_nodes = [node_index[i] for i in individuals if i in node_index]
+        node_mask[torch.tensor(witness_nodes, dtype=torch.long)] = 1.0
+
+        explanation = Explanation(node_mask=node_mask.to(x.device))
+        if self.explainer_config.edge_mask_type is not None:
+            assert isinstance(edge_index, Tensor)
+            edge_mask = self._get_edge_mask(edge_index, individuals, pairs,
+                                            node_index)
+            explanation.edge_mask = edge_mask.to(x.device)
+        explanation.graph_mask = graph_mask.to(x.device)
+        agreement = graph_mask.view(-1).bool() == (target == cls)
+        explanation.concept_agreement = agreement.to(x.device)
+
+        explanation.concept = result['concepts'][0]
+        explanation.concepts = result['concepts']
+        explanation.concept_class = cls
+        explanation.concept_accuracy = result['accuracy']
+        explanation.concept_f1 = result['f1']
+        explanation._class_expressions = result['class_expressions']
+        return explanation
+
+    def _prepare_graph_knowledge_base(
+        self,
+        x: Tensor,
+        edge_index: Tensor,
+        batch: Tensor,
+        num_graphs: int,
+        kwargs: Dict[str, Any],
+    ) -> None:
+        r"""Builds (or re-uses) the knowledge base of a batch of graphs, in
+        which every graph is an individual of :obj:`pyg:Graph`.
+        """
+        from torch_geometric.utils import to_owl
+
+        if self.data is not None:
+            raise ValueError("Expected 'data' to be a graph dataset (a list "
+                             "of 'Data' objects) for graph-level tasks")
+        graph_data = self.graph_data
+        if graph_data is not None:
+            if len(graph_data) != num_graphs:
+                raise ValueError(f"The number of graphs in 'data' "
+                                 f"({len(graph_data)}) does not match the "
+                                 f"number of graphs in the input "
+                                 f"({num_graphs})")
+            num_nodes = sum(int(item.num_nodes or 0) for item in graph_data)
+            if num_nodes != x.size(0):
+                raise ValueError(f"The number of nodes in 'data' "
+                                 f"({num_nodes}) does not match the number "
+                                 f"of nodes in the input ({x.size(0)})")
+            key: Tuple[Any, ...] = ('graph', id(graph_data))
+        else:
+            tensors = [x, edge_index, kwargs.get('batch')]
+            key = ('graph', ) + tuple(
+                None if t is None else (t.data_ptr(), tuple(t.size()))
+                for t in tensors)
+        if key == self._kb_key:
+            return
+
+        source: Optional[str] = None
+        if graph_data is not None:
+            data = Batch.from_data_list(graph_data)
+            first = graph_data[0]
+            schema = to_owl_schema(
+                first.schema if isinstance(first, OWLData) else self.schema)
+            sources = {
+                item.source if isinstance(item, OWLData) else None
+                for item in graph_data
+            }
+            if len(sources) == 1:
+                source = sources.pop()
+        else:
+            attrs = {
+                name: kwargs[name].detach().cpu()
+                for name in ['edge_type', 'edge_attr', 'graph_attr']
+                if isinstance(kwargs.get(name), Tensor)
+            }
+            data = Batch(x=x.detach().cpu(),
+                         edge_index=edge_index.detach().cpu(), batch=batch,
+                         **attrs)
+            schema = to_owl_schema(self.schema)
+        assert isinstance(data, Data)
+        counts = torch.bincount(batch, minlength=num_graphs)
+        data.ptr = torch.cat([counts.new_zeros(1), counts.cumsum(0)])
+
+        node_iri = list(data.node_iri) if 'node_iri' in data else []
+        if len(node_iri) > 0 and isinstance(node_iri[0], (list, tuple)):
+            node_iri = [iri for iris in node_iri for iri in iris]
+        if len(node_iri) != x.size(0):
+            node_iri = [schema.node_iri(i) for i in range(x.size(0))]
+        graph_iri = list(data.graph_iri) if 'graph_iri' in data else []
+        if len(graph_iri) != num_graphs:
+            graph_iri = [schema.graph_iri(i) for i in range(num_graphs)]
+        data.node_iri, data.graph_iri = node_iri, graph_iri
+
+        def save(path: str) -> str:
+            to_owl(data, schema).serialize(destination=path, format='xml')
+            return path
+
+        self._load_knowledge_base(source, save, schema, node_iri + graph_iri)
+        self._example_iri = graph_iri
+        self._iri_index = {iri: (None, i) for i, iri in enumerate(graph_iri)}
+        self._node_iri = node_iri
+        self._kb_key = key
+
+    def _get_witnesses(
+        self,
+        expression: Any,
+        graphs: Tensor,
+    ) -> Tuple[Set[str], Set[Tuple[str, str]]]:
+        r"""Returns the witnesses of :obj:`expression` in :obj:`graphs` (the
+        individuals that make the graphs instances of :obj:`expression`), and
+        the pairs of individuals that are connected by the object properties
+        the expression follows.
+        """
+        individuals: Set[str] = set()
+        pairs: Set[Tuple[str, str]] = set()
+        visited: Set[Tuple[Any, str]] = set()
+        for i in graphs.tolist():
+            self._witness(expression, self._example_iri[i], individuals, pairs,
+                          visited)
+        return individuals, pairs
+
+    def _witness(
+        self,
+        expression: Any,
+        iri: str,
+        individuals: Set[str],
+        pairs: Set[Tuple[str, str]],
+        visited: Set[Tuple[Any, str]],
+    ) -> None:
+        r"""Collects the witnesses of the instance :obj:`iri` of
+        :obj:`expression`.
+
+        * :obj:`C ⊓ D`: The witnesses of :obj:`C` and :obj:`D`.
+        * :obj:`C ⊔ D`: The witnesses of the operands :obj:`iri` is an
+          instance of.
+        * :obj:`∃ r.C`, :obj:`≥ n r.C`, :obj:`= n r.C`, :obj:`∀ r.C`: The
+          :obj:`r`-fillers of :obj:`iri` that are instances of :obj:`C`, and
+          their witnesses of :obj:`C`.
+        * :obj:`∃ r.{a}`: The individual :obj:`a`.
+        * Classes, data property restrictions, :obj:`¬ C` and
+          :obj:`≤ n r.C`: No witnesses, since they hold for :obj:`iri` itself
+          or describe the absence of fillers.
+        """
+        from owlapy.class_expression import (
+            OWLObjectHasValue,
+            OWLObjectIntersectionOf,
+            OWLObjectMaxCardinality,
+            OWLObjectUnionOf,
+            OWLQuantifiedObjectRestriction,
+        )
+        from owlapy.owl_property import OWLObjectInverseOf
+
+        if (expression, iri) in visited:
+            return
+        visited.add((expression, iri))
+
+        def add(prop: Any, filler: str) -> None:
+            individuals.add(filler)
+            if isinstance(prop, OWLObjectInverseOf):
+                pairs.add((filler, iri))
+            else:
+                pairs.add((iri, filler))
+
+        if isinstance(expression, OWLObjectIntersectionOf):
+            for operand in expression.operands():
+                self._witness(operand, iri, individuals, pairs, visited)
+        elif isinstance(expression, OWLObjectUnionOf):
+            for operand in expression.operands():
+                if iri in self._instances(operand):
+                    self._witness(operand, iri, individuals, pairs, visited)
+        elif isinstance(expression, OWLObjectHasValue):
+            prop, value = expression.get_property(), expression.get_filler()
+            if value.str in self._fillers(iri, prop):
+                add(prop, value.str)
+        elif (isinstance(expression, OWLQuantifiedObjectRestriction)
+              and not isinstance(expression, OWLObjectMaxCardinality)):
+            prop, filler = expression.get_property(), expression.get_filler()
+            instances = self._instances(filler)
+            for value in self._fillers(iri, prop):
+                if value in instances:
+                    add(prop, value)
+                    self._witness(filler, value, individuals, pairs, visited)
+
+    def _instances(self, expression: Any) -> Set[str]:
+        r"""Returns the IRIs of the instances of :obj:`expression`."""
+        if expression not in self._instance_cache:
+            self._instance_cache[expression] = {
+                individual.str
+                for individual in self._kb.individuals_set(expression)
+            }
+        return self._instance_cache[expression]
+
+    def _fillers(self, iri: str, prop: Any) -> List[str]:
+        r"""Returns the IRIs of the :obj:`prop`-fillers of :obj:`iri`."""
+        from owlapy.iri import IRI
+        from owlapy.owl_individual import OWLNamedIndividual
+
+        key = (iri, prop)
+        if key not in self._filler_cache:
+            individual = OWLNamedIndividual(IRI.create(iri))
+            self._filler_cache[key] = [
+                value.str for value in self._kb.get_object_property_values(
+                    individual, prop)
+            ]
+        return self._filler_cache[key]
+
+    def _get_edge_mask(
+        self,
+        edge_index: Tensor,
+        individuals: Set[str],
+        pairs: Set[Tuple[str, str]],
+        node_index: Dict[str, int],
+    ) -> Tensor:
+        r"""Returns the mask of the edges between witnesses that the concept
+        follows, and of the edges whose reified individuals are witnesses.
+        """
+        connected = {(a, b)
+                     for a, b in pairs if a in node_index and b in node_index}
+        reified = [iri for iri in individuals if iri not in node_index]
+        if len(reified) > 0:
+            endpoints = self._get_edge_endpoints()
+            connected |= {endpoints[i] for i in reified if i in endpoints}
+
+        row, col = edge_index.detach().cpu().tolist()
+        return torch.tensor(
+            [(self._node_iri[i], self._node_iri[j]) in connected
+             for i, j in zip(row, col)], dtype=torch.float)
+
+    def _get_edge_endpoints(self) -> Dict[str, Tuple[str, str]]:
+        r"""Returns the source and target node of every reified edge (an
+        individual of :obj:`pyg:Edge`).
+        """
+        if self._edge_endpoints is None:
+            from owlapy.iri import IRI
+            from owlapy.owl_property import OWLObjectProperty
+
+            outgoing = OWLObjectProperty(IRI.create(PYG_HAS_OUTGOING_EDGE))
+            incoming = OWLObjectProperty(IRI.create(PYG_HAS_INCOMING_EDGE))
+            src: Dict[str, str] = {}
+            dst: Dict[str, str] = {}
+            for iri in self._node_iri:
+                for edge in self._fillers(iri, outgoing):
+                    src[edge] = iri
+                for edge in self._fillers(iri, incoming):
+                    dst[edge] = iri
+            self._edge_endpoints = {
+                edge: (src[edge], dst[edge])
+                for edge in src if edge in dst
+            }
+        return self._edge_endpoints
+
+    ###########################################################################
 
     def _get_class(
         self,
@@ -509,8 +918,9 @@ class OntolearnExplainer(ExplainerAlgorithm):
             classes = target[index].unique()
             if classes.numel() != 1:
                 raise ValueError(f"'{self.__class__.__name__}' explains one "
-                                 f"class at a time, but the nodes in 'index' "
-                                 f"belong to the classes {classes.tolist()}")
+                                 f"class at a time, but the examples in "
+                                 f"'index' belong to the classes "
+                                 f"{classes.tolist()}")
             return int(classes[0])
 
         if self.target_class is not None:
@@ -568,7 +978,7 @@ class OntolearnExplainer(ExplainerAlgorithm):
 
         def individuals(index: Tensor) -> set:
             return {
-                OWLNamedIndividual(IRI.create(self._node_iri[i]))
+                OWLNamedIndividual(IRI.create(self._example_iri[i]))
                 for i in index.tolist()
             }
 
@@ -596,8 +1006,8 @@ class OntolearnExplainer(ExplainerAlgorithm):
             for key, value in index.items()
         }
 
-        mapping = {iri: i for i, iri in enumerate(self._node_iri)}
-        covered = torch.zeros(len(self._node_iri), dtype=torch.bool)
+        mapping = {iri: i for i, iri in enumerate(self._example_iri)}
+        covered = torch.zeros(len(self._example_iri), dtype=torch.bool)
         for individual in instances:
             if individual.str in mapping:
                 covered[mapping[individual.str]] = True

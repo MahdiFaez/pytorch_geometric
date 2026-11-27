@@ -179,7 +179,7 @@ def test_ontolearn_explainer_supports():
     with pytest.raises(ValueError, match="not support the given explanation"):
         Explainer(GCN(), OntolearnExplainer(), explanation_type='model',
                   node_mask_type='object',
-                  model_config=dict(model_config, task_level='graph'))
+                  model_config=dict(model_config, task_level='edge'))
     with pytest.raises(ValueError, match="not support the given explanation"):
         Explainer(
             GCN(1), OntolearnExplainer(), explanation_type='model',
@@ -339,3 +339,217 @@ def test_ontolearn_explainer_hetero_errors():
     with pytest.raises(ValueError, match="to be heterogeneous"):
         explainer(data.x_dict, data.edge_index_dict, target=data['author'].y,
                   index=0)
+
+
+MOL = 'http://example.org/mol#'
+
+
+def get_molecules() -> list:
+    # Molecules of even index hold a nitrogen atom bonded to an oxygen atom
+    # (the planted concept of class 1), molecules of odd index hold an oxygen
+    # atom that is only bonded to carbon atoms:
+    generator = torch.Generator().manual_seed(0)
+    data_list = []
+    for i in range(16):
+        num_nodes = 4 + i % 3
+        atoms = torch.randint(0, 2, (num_nodes, ), generator=generator)
+        if i % 2 == 0:
+            atoms[0], atoms[1] = 1, 2
+        else:
+            atoms[:4] = torch.tensor([0, 2, 0, 0])
+        row = torch.arange(num_nodes - 1)
+        col = row + 1
+        edge_index = torch.cat(
+            [torch.stack([row, col]),
+             torch.stack([col, row])], dim=1)
+        x = torch.nn.functional.one_hot(atoms, 3).float()
+        data_list.append(
+            Data(x=x, edge_index=edge_index,
+                 y=torch.tensor([int(i % 2 == 0)])))
+    return data_list
+
+
+def get_molecule_schema() -> OWLSchema:
+    return OWLSchema(base_iri=MOL, node_class='Atom', graph_class='Molecule',
+                     has_node_name='hasAtom', relation_names=['bond'],
+                     feature_names=['C', 'N', 'O'])
+
+
+class NitroModel(torch.nn.Module):
+    # Predicts class 1 for graphs with a bond from nitrogen to oxygen:
+    def forward(self, x, edge_index, batch):
+        row, col = edge_index
+        score = torch.zeros(int(batch.max()) + 1)
+        score.scatter_add_(0, batch[row], x[row, 1] * x[col, 2])
+        return torch.stack([-score, score],
+                           dim=-1) - 0.5 * torch.tensor([-1.0, 1.0])
+
+
+def get_graph_explainer(algorithm, explanation_type='phenomenon',
+                        edge_mask_type='object'):
+    return Explainer(
+        model=NitroModel(),
+        algorithm=algorithm,
+        explanation_type=explanation_type,
+        node_mask_type='object',
+        edge_mask_type=edge_mask_type,
+        model_config=dict(
+            mode='multiclass_classification',
+            task_level='graph',
+            return_type='raw',
+        ),
+    )
+
+
+@withPackage('ontolearn', 'rdflib')
+def test_ontolearn_explainer_graph():
+    from torch_geometric.data import Batch
+    from torch_geometric.data.owl_data import PYG_HAS_NODE
+
+    batch = Batch.from_data_list(get_molecules())
+    algorithm = OntolearnExplainer('CELOE', schema=get_molecule_schema(),
+                                   max_runtime=3)
+    explainer = get_graph_explainer(algorithm)
+    explanation = explainer(batch.x, batch.edge_index, target=batch.y, index=0,
+                            batch=batch.batch)
+
+    assert isinstance(explanation, Explanation)
+    assert 'hasAtom' in explanation.concept and 'N' in explanation.concept
+    assert explanation.concept_class == 1
+    assert explanation.concept_accuracy == 1.0
+    assert explanation.graph_mask.size() == (batch.num_graphs, 1)
+    assert explanation.graph_mask.view(-1).tolist() == batch.y.float().tolist()
+    assert bool(explanation.concept_agreement.all())
+
+    # The witnesses are the nitrogen atoms of the positive graphs (and the
+    # oxygen atoms they are bonded to, if the concept mentions them):
+    witnesses = explanation.node_mask.view(-1).bool()
+    assert explanation.node_mask.size() == (batch.num_nodes, 1)
+    assert batch.y[batch.batch[witnesses]].tolist() == [1] * int(
+        witnesses.sum())
+    assert batch.x[witnesses, 0].sum() == 0  # No carbon atoms.
+    nitrogen = (batch.x[:, 1] == 1) & (batch.y[batch.batch] == 1)
+    assert bool(witnesses[nitrogen & (batch.x[:, 1] == 1)].any())
+    assert explanation.edge_mask.size() == (batch.num_edges, )
+    row, col = batch.edge_index[:, explanation.edge_mask.bool()]
+    assert bool(witnesses[row].all()) and bool(witnesses[col].all())
+
+    # `pyg:hasNode` holds no assertions (graphs use `hasAtom`), so it is not
+    # searched:
+    properties = [p.str for p in algorithm._kb.get_object_properties()]
+    assert MOL + 'hasAtom' in properties and PYG_HAS_NODE not in properties
+
+    # Results (and witnesses) are cached, and `index` selects the class:
+    explanation = explainer(batch.x, batch.edge_index, target=batch.y, index=2,
+                            batch=batch.batch)
+    assert len(algorithm._cache) == 1
+    explanation = explainer(batch.x, batch.edge_index, target=batch.y, index=1,
+                            batch=batch.batch)
+    assert explanation.concept_class == 0
+    assert explanation.graph_mask.view(-1).tolist() == (
+        batch.y == 0).float().tolist()
+
+
+@withPackage('ontolearn', 'rdflib')
+def test_ontolearn_explainer_graph_model_and_data(tmp_path):
+    from torch_geometric.data import Batch
+    from torch_geometric.utils import from_owl, to_owl
+
+    # A graph dataset read from OWL, explained via the model's predictions,
+    # without edge masks and with subsampled examples:
+    path = str(tmp_path / 'molecules.owl')
+    to_owl(get_molecules(), get_molecule_schema()).serialize(path, 'xml')
+    data_list = from_owl(
+        path, graph_level=True, add_inverse_edges=False,
+        schema=OWLSchema(base_iri=MOL, graph_class='Molecule'))
+    batch = Batch.from_data_list(data_list)
+    algorithm = OntolearnExplainer('CELOE', data=data_list, target_class=1,
+                                   max_examples=6, balanced=True, seed=0,
+                                   max_runtime=3)
+    explainer = get_graph_explainer(algorithm, 'model', edge_mask_type=None)
+    explanation = explainer(batch.x[:, :3], batch.edge_index,
+                            batch=batch.batch)
+    assert explanation.target.tolist() == [1, 0] * 8
+    assert explanation.concept_class == 1
+    assert explanation.concept_accuracy == 1.0
+    assert 'edge_mask' not in explanation
+    assert explanation.graph_mask.size() == (16, 1)
+    assert algorithm._kb.path == path  # The original ontology is used.
+
+    with pytest.raises(ValueError, match="number of graphs in 'data'"):
+        explainer(batch.x[:, :3], batch.edge_index,
+                  batch=torch.zeros(batch.num_nodes, dtype=torch.long))
+    with pytest.raises(ValueError, match="number of nodes in 'data'"):
+        other = Batch.from_data_list(data_list[:15] + data_list[14:15])
+        assert other.num_nodes != batch.num_nodes
+        small = other
+        explainer(small.x[:, :3], small.edge_index, batch=small.batch)
+
+    algorithm = OntolearnExplainer(data=data_list[0])
+    explainer = get_graph_explainer(algorithm)
+    with pytest.raises(ValueError, match="graph dataset"):
+        explainer(batch.x, batch.edge_index, target=explanation.target,
+                  batch=batch.batch)
+    with pytest.raises(ValueError, match="non-empty list"):
+        OntolearnExplainer(data=[])
+
+
+@withPackage('ontolearn', 'rdflib')
+def test_ontolearn_explainer_graph_witnesses():
+    from owlapy.class_expression import (
+        OWLClass,
+        OWLObjectComplementOf,
+        OWLObjectIntersectionOf,
+        OWLObjectMaxCardinality,
+        OWLObjectMinCardinality,
+        OWLObjectSomeValuesFrom,
+        OWLObjectUnionOf,
+    )
+    from owlapy.iri import IRI
+    from owlapy.owl_property import OWLObjectInverseOf, OWLObjectProperty
+
+    from torch_geometric.data import Batch
+
+    data_list = get_molecules()[:2]
+    batch = Batch.from_data_list(data_list)
+    algorithm = OntolearnExplainer('CELOE', schema=get_molecule_schema(),
+                                   max_runtime=1)
+    explainer = get_graph_explainer(algorithm)
+    explainer(batch.x, batch.edge_index, target=batch.y, index=0,
+              batch=batch.batch)
+
+    def cls(name):
+        return OWLClass(IRI.create(MOL + name))
+
+    has_atom = OWLObjectProperty(IRI.create(MOL + 'hasAtom'))
+    bond = OWLObjectProperty(IRI.create(MOL + 'bond'))
+    nitrogen = OWLObjectSomeValuesFrom(has_atom, cls('N'))
+    nitro = OWLObjectSomeValuesFrom(
+        has_atom,
+        OWLObjectIntersectionOf(
+            [cls('N'), OWLObjectSomeValuesFrom(bond, cls('O'))]))
+    graphs = torch.arange(2)
+
+    def witnesses(expression):
+        individuals, _ = algorithm._get_witnesses(expression, graphs)
+        index = {iri: i for i, iri in enumerate(algorithm._node_iri)}
+        return sorted(index[iri] for iri in individuals if iri in index)
+
+    n = batch.x[:, 1].nonzero().view(-1).tolist()
+    row, col = batch.edge_index
+    bonded = (batch.x[row, 1] == 1) & (batch.x[col, 2] == 1)  # N-O bonds.
+    nitro_atoms = sorted(set(row[bonded].tolist() + col[bonded].tolist()))
+    assert 0 in nitro_atoms and 1 in nitro_atoms
+    assert witnesses(nitrogen) == n
+    assert witnesses(nitro) == nitro_atoms
+    assert witnesses(OWLObjectMinCardinality(1, has_atom, cls('N'))) == n
+    # Negation and upper bounds have no witnesses:
+    assert witnesses(OWLObjectComplementOf(nitrogen)) == []
+    assert witnesses(OWLObjectMaxCardinality(1, has_atom, cls('N'))) == []
+    # Unions only collect the witnesses of the operands that hold:
+    union = OWLObjectUnionOf([nitro, cls('C')])
+    assert witnesses(union) == nitro_atoms
+    # Inverse properties are followed backwards:
+    inverse = OWLObjectSomeValuesFrom(
+        has_atom, OWLObjectSomeValuesFrom(OWLObjectInverseOf(bond), cls('N')))
+    assert 1 in witnesses(inverse) and 0 in witnesses(inverse)

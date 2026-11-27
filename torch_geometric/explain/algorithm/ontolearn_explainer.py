@@ -124,6 +124,22 @@ class OntolearnExplainer(ExplainerAlgorithm):
     * :obj:`node_mask`: A :obj:`[num_nodes, 1]` mask that is :obj:`1` for all
       nodes that are instances of :obj:`concept`. This allows to evaluate
       the concept with the metrics in :mod:`torch_geometric.explain.metric`.
+    * :obj:`concept_agreement`: A boolean :obj:`[num_nodes]` vector that is
+      :obj:`True` where the decision of the concept (whether a node is an
+      instance) agrees with :obj:`target`, *i.e.*, where the concept is a
+      faithful explanation of the node's (predicted) class.
+    * :obj:`witness_mask`: A :obj:`[num_nodes, 1]` mask of the *witnesses*
+      of the explained nodes in :obj:`index` (of all instances if
+      :obj:`index` is not given), *i.e.*, the nodes that make them instances
+      of :obj:`concept`. For :obj:`Female ⊓ (∃ hasSibling.Parent)`, these are
+      the siblings that are parents. Together with :obj:`concept`, this is
+      the local explanation of the nodes in :obj:`index`. Negated parts
+      (:obj:`¬`) and upper bounds (:obj:`≤ n`) have no witnesses.
+    * :obj:`edge_mask` (if :obj:`edge_mask_type="object"`): A
+      :obj:`[num_edges]` mask of the witness edges, *i.e.*, the edges that
+      represent the object property assertions the concept follows (and
+      their inverse edges), or whose (reified) edge individuals are
+      witnesses.
 
     .. code-block:: python
 
@@ -153,7 +169,9 @@ class OntolearnExplainer(ExplainerAlgorithm):
     :class:`~torch_geometric.data.OWLHeteroData` object, :obj:`node_type`
     is the node type that the model makes predictions for, and the returned
     :class:`~torch_geometric.explain.HeteroExplanation` holds one
-    :obj:`node_mask` per node type.
+    :obj:`node_mask` and :obj:`witness_mask` per node type (and one
+    :obj:`edge_mask` per edge type), and :obj:`concept_agreement` is stored
+    for :obj:`node_type`.
 
     For graph-level tasks (:obj:`task_level="graph"`), the inputs are a
     batch of graphs (passing :obj:`batch` to the explainer), and all graphs
@@ -175,13 +193,12 @@ class OntolearnExplainer(ExplainerAlgorithm):
       :obj:`target`, *i.e.*, where the concept is a faithful explanation of
       the graph's (predicted) class.
     * :obj:`node_mask`: A :obj:`[num_nodes, 1]` mask of the *witnesses* of
-      :obj:`concept`, *i.e.*, the nodes that make a graph an instance of the
-      concept. For :obj:`∃ hasAtom.(N ⊓ ∃ bond.O)`, these are the nitrogen
-      atoms bonded to an oxygen atom, and those oxygen atoms. Negated parts
-      (:obj:`¬`) and upper bounds (:obj:`≤ n`) have no witnesses.
-    * :obj:`edge_mask` (if :obj:`edge_mask_type="object"`): A
-      :obj:`[num_edges]` mask of the edges that the witnesses are connected
-      by, or whose (reified) edge individuals are witnesses.
+      :obj:`concept` in all graphs that are instances, *i.e.*, the nodes that
+      make a graph an instance of the concept. For
+      :obj:`∃ hasAtom.(N ⊓ ∃ bond.O)`, these are the nitrogen atoms bonded to
+      an oxygen atom, and those oxygen atoms.
+    * :obj:`edge_mask` (if :obj:`edge_mask_type="object"`): The witness
+      edges, as for node-level tasks.
 
     .. note::
 
@@ -301,8 +318,15 @@ class OntolearnExplainer(ExplainerAlgorithm):
         # graphs, and the graph index for graph-level tasks):
         self._example_iri: List[str] = []
         self._iri_index: Dict[str, Tuple[Optional[str], int]] = {}
-        # The IRIs of the nodes of a batch of graphs (for witnesses):
+        # The IRIs of all nodes (per node type, with node type `None` in
+        # homogeneous graphs), and the node type and index of every node:
+        self._node_iris: Dict[Optional[str], List[str]] = {}
+        self._node_index: Dict[str, Tuple[Optional[str], int]] = {}
         self._node_iri: List[str] = []
+        # The schema and edge types of the graph the knowledge base was built
+        # from, which map edges to the facts they represent:
+        self._kb_schema: OWLSchema = OWLSchema()
+        self._kb_edge_type: Optional[Tensor] = None
         self._cache: Dict[Tuple[Any, ...], Dict[str, Any]] = {}
         self._instance_cache: Dict[Any, Set[str]] = {}
         self._filler_cache: Dict[Tuple[str, Any], List[str]] = {}
@@ -350,6 +374,25 @@ class OntolearnExplainer(ExplainerAlgorithm):
                 mask[members.to(device)] = 1.0
             return mask
 
+        # The witnesses of the explained nodes that are instances (of all
+        # instances if no `index` is given):
+        members = result['members'].get(node_type)
+        if members is None:
+            members = torch.empty(0, dtype=torch.long)
+        is_member = torch.zeros(num_nodes, dtype=torch.bool)
+        is_member[members] = True
+        if index is not None:
+            roots = torch.as_tensor(index, dtype=torch.long).view(-1).cpu()
+            roots = roots[is_member[roots]]
+        else:
+            roots = members
+        individuals, facts = self._get_witnesses(
+            result['class_expressions'][0],
+            [self._example_iri[i] for i in roots.tolist()])
+        witness_masks, edge_masks = self._get_witness_masks(
+            individuals, facts, x, edge_index, kwargs.get('edge_type'))
+        agreement = is_member == (target == cls)
+
         explanation: Union[Explanation, HeteroExplanation]
         if isinstance(x, dict):
             explanation = HeteroExplanation()
@@ -360,9 +403,27 @@ class OntolearnExplainer(ExplainerAlgorithm):
                               value.device)
                     for key, value in x.items()
                 })
+            explanation.set_value_dict(
+                'witness_mask', {
+                    key: witness_masks[key].to(value.device)
+                    for key, value in x.items()
+                })
+            if edge_masks is not None:
+                assert isinstance(edge_index, dict)
+                explanation.set_value_dict(
+                    'edge_mask', {
+                        key: edge_masks[key].to(value.device)
+                        for key, value in edge_index.items()
+                    })
+            explanation[node_type].concept_agreement = agreement.to(
+                x[node_type].device)
         else:
             explanation = Explanation(node_mask=node_mask(
                 num_nodes, result['members'].get(None), x.device))
+            explanation.witness_mask = witness_masks[None].to(x.device)
+            if edge_masks is not None:
+                explanation.edge_mask = edge_masks[None].to(x.device)
+            explanation.concept_agreement = agreement.to(x.device)
 
         explanation.concept = result['concepts'][0]
         explanation.concepts = result['concepts']
@@ -398,13 +459,7 @@ class OntolearnExplainer(ExplainerAlgorithm):
             return False
 
         # Edge masks (which can only be of type 'object') hold the edges of
-        # witnesses of graph-level concepts:
-        edge_mask_type = self.explainer_config.edge_mask_type
-        if task_level == ModelTaskLevel.node and edge_mask_type is not None:
-            logging.error(f"'{self.__class__.__name__}' does not support "
-                          f"edge masks for node-level explanations got "
-                          f"(`edge_mask_type={edge_mask_type.value}`)")
-            return False
+        # the witnesses of the concept.
 
         return True
 
@@ -491,20 +546,29 @@ class OntolearnExplainer(ExplainerAlgorithm):
             )
         assert data is not None
 
-        iri_index: Dict[str, Tuple[Optional[str], int]] = {}
+        node_iris: Dict[Optional[str], List[str]] = {}
         if isinstance(data, OWLHeteroData):
             for key_, store in data.node_items():
-                for i, iri in enumerate(store.node_iri):
-                    iri_index[iri] = (key_, i)
-            node_iri = list(data[node_type].node_iri)
+                node_iris[key_] = list(store.node_iri)
         else:
-            iri_index = {iri: (None, i) for i, iri in enumerate(data.node_iri)}
-            node_iri = list(data.node_iri)
+            node_iris[None] = list(data.node_iri)
+        iri_index = {
+            iri: (key_, i)
+            for key_, iris in node_iris.items()
+            for i, iri in enumerate(iris)
+        }
+        node_iri = node_iris[node_type]
 
         self._load_knowledge_base(data.source, data.save_owl, data.schema,
                                   list(iri_index.keys()))
+        self._kb_edge_type = None
+        if isinstance(data, OWLData) and data.edge_index is not None:
+            self._kb_edge_type = self._edge_type_of(data)
         self._example_iri = node_iri
         self._iri_index = iri_index
+        self._node_iris = node_iris
+        self._node_index = iri_index
+        self._node_iri = list(iri_index.keys())
         self._kb_key = key
 
     def _load_knowledge_base(
@@ -591,6 +655,7 @@ class OntolearnExplainer(ExplainerAlgorithm):
             kb = getattr(learner, 'kb', kb)
 
         self._kb, self._concept_learner = kb, learner
+        self._kb_schema = schema
         self._cache = {}
         self._instance_cache = {}
         self._filler_cache = {}
@@ -648,20 +713,14 @@ class OntolearnExplainer(ExplainerAlgorithm):
         # Witnesses are computed once per concept and batch:
         if 'witnesses' not in result:
             result['witnesses'] = self._get_witnesses(
-                result['class_expressions'][0], members)
-        individuals, pairs = result['witnesses']
+                result['class_expressions'][0],
+                [self._example_iri[i] for i in members.tolist()])
+        node_masks, edge_masks = self._get_witness_masks(
+            *result['witnesses'], x, edge_index, kwargs.get('edge_type'))
 
-        node_mask = torch.zeros(x.size(0), 1)
-        node_index = {iri: i for i, iri in enumerate(self._node_iri)}
-        witness_nodes = [node_index[i] for i in individuals if i in node_index]
-        node_mask[torch.tensor(witness_nodes, dtype=torch.long)] = 1.0
-
-        explanation = Explanation(node_mask=node_mask.to(x.device))
-        if self.explainer_config.edge_mask_type is not None:
-            assert isinstance(edge_index, Tensor)
-            edge_mask = self._get_edge_mask(edge_index, individuals, pairs,
-                                            node_index)
-            explanation.edge_mask = edge_mask.to(x.device)
+        explanation = Explanation(node_mask=node_masks[None].to(x.device))
+        if edge_masks is not None:
+            explanation.edge_mask = edge_masks[None].to(x.device)
         explanation.graph_mask = graph_mask.to(x.device)
         agreement = graph_mask.view(-1).bool() == (target == cls)
         explanation.concept_agreement = agreement.to(x.device)
@@ -752,35 +811,37 @@ class OntolearnExplainer(ExplainerAlgorithm):
             return path
 
         self._load_knowledge_base(source, save, schema, node_iri + graph_iri)
+        self._kb_edge_type = self._edge_type_of(data)
         self._example_iri = graph_iri
         self._iri_index = {iri: (None, i) for i, iri in enumerate(graph_iri)}
+        self._node_iris = {None: node_iri}
+        self._node_index = {iri: (None, i) for i, iri in enumerate(node_iri)}
         self._node_iri = node_iri
         self._kb_key = key
 
     def _get_witnesses(
         self,
         expression: Any,
-        graphs: Tensor,
-    ) -> Tuple[Set[str], Set[Tuple[str, str]]]:
-        r"""Returns the witnesses of :obj:`expression` in :obj:`graphs` (the
-        individuals that make the graphs instances of :obj:`expression`), and
-        the pairs of individuals that are connected by the object properties
-        the expression follows.
+        roots: List[str],
+    ) -> Tuple[Set[str], Set[Tuple[str, str, str]]]:
+        r"""Returns the witnesses of :obj:`expression` for the instances
+        :obj:`roots` (the individuals that make them instances of
+        :obj:`expression`), and the object property assertions
+        :obj:`(subject, property, object)` the expression follows.
         """
         individuals: Set[str] = set()
-        pairs: Set[Tuple[str, str]] = set()
+        facts: Set[Tuple[str, str, str]] = set()
         visited: Set[Tuple[Any, str]] = set()
-        for i in graphs.tolist():
-            self._witness(expression, self._example_iri[i], individuals, pairs,
-                          visited)
-        return individuals, pairs
+        for root in roots:
+            self._witness(expression, root, individuals, facts, visited)
+        return individuals, facts
 
     def _witness(
         self,
         expression: Any,
         iri: str,
         individuals: Set[str],
-        pairs: Set[Tuple[str, str]],
+        facts: Set[Tuple[str, str, str]],
         visited: Set[Tuple[Any, str]],
     ) -> None:
         r"""Collects the witnesses of the instance :obj:`iri` of
@@ -813,17 +874,17 @@ class OntolearnExplainer(ExplainerAlgorithm):
         def add(prop: Any, filler: str) -> None:
             individuals.add(filler)
             if isinstance(prop, OWLObjectInverseOf):
-                pairs.add((filler, iri))
+                facts.add((filler, prop.get_named_property().str, iri))
             else:
-                pairs.add((iri, filler))
+                facts.add((iri, prop.str, filler))
 
         if isinstance(expression, OWLObjectIntersectionOf):
             for operand in expression.operands():
-                self._witness(operand, iri, individuals, pairs, visited)
+                self._witness(operand, iri, individuals, facts, visited)
         elif isinstance(expression, OWLObjectUnionOf):
             for operand in expression.operands():
                 if iri in self._instances(operand):
-                    self._witness(operand, iri, individuals, pairs, visited)
+                    self._witness(operand, iri, individuals, facts, visited)
         elif isinstance(expression, OWLObjectHasValue):
             prop, value = expression.get_property(), expression.get_filler()
             if value.str in self._fillers(iri, prop):
@@ -835,7 +896,7 @@ class OntolearnExplainer(ExplainerAlgorithm):
             for value in self._fillers(iri, prop):
                 if value in instances:
                     add(prop, value)
-                    self._witness(filler, value, individuals, pairs, visited)
+                    self._witness(filler, value, individuals, facts, visited)
 
     def _instances(self, expression: Any) -> Set[str]:
         r"""Returns the IRIs of the instances of :obj:`expression`."""
@@ -860,27 +921,127 @@ class OntolearnExplainer(ExplainerAlgorithm):
             ]
         return self._filler_cache[key]
 
-    def _get_edge_mask(
-        self,
-        edge_index: Tensor,
-        individuals: Set[str],
-        pairs: Set[Tuple[str, str]],
-        node_index: Dict[str, int],
-    ) -> Tensor:
-        r"""Returns the mask of the edges between witnesses that the concept
-        follows, and of the edges whose reified individuals are witnesses.
+    @staticmethod
+    def _edge_type_of(data: Data) -> Optional[Tensor]:
+        r"""Returns the edge types of :obj:`data` (all :obj:`0` if it has
+        none, as assumed by :meth:`~torch_geometric.utils.to_owl`).
         """
-        connected = {(a, b)
-                     for a, b in pairs if a in node_index and b in node_index}
-        reified = [iri for iri in individuals if iri not in node_index]
-        if len(reified) > 0:
-            endpoints = self._get_edge_endpoints()
-            connected |= {endpoints[i] for i in reified if i in endpoints}
+        if not isinstance(data.edge_index, Tensor):
+            return None
+        edge_type = data.edge_type if 'edge_type' in data else None
+        if isinstance(edge_type, Tensor):
+            return edge_type.detach().cpu().view(-1)
+        return torch.zeros(data.edge_index.size(1), dtype=torch.long)
 
-        row, col = edge_index.detach().cpu().tolist()
-        return torch.tensor(
-            [(self._node_iri[i], self._node_iri[j]) in connected
-             for i, j in zip(row, col)], dtype=torch.float)
+    def _get_relations(
+        self,
+        edge_type: Optional[Tensor],
+        num_edges: int,
+    ) -> Optional[List[Tuple[str, bool]]]:
+        r"""Returns the object property of every edge of a homogeneous graph,
+        and whether the edge points from its subject to its object (or is an
+        inverse edge), or :obj:`None` if the edge types are unknown.
+        """
+        if not isinstance(edge_type, Tensor) or edge_type.numel() != num_edges:
+            edge_type = self._kb_edge_type
+        if edge_type is None or edge_type.numel() != num_edges:
+            return None
+        schema = self._kb_schema
+        types = edge_type.view(-1).tolist()
+        inverse = schema.inverse_edge_types
+        num_relations = 0
+        if len(types) > 0:
+            num_relations = (max(types) // 2 if inverse else max(types)) + 1
+        if isinstance(schema.relation_names, list):
+            num_relations = max(num_relations, len(schema.relation_names))
+        iris = [
+            schema.relation_iri(r, num_relations) for r in range(num_relations)
+        ]
+        if inverse:
+            return [(iris[t // 2], t % 2 == 0) for t in types]
+        return [(iris[t], True) for t in types]
+
+    def _get_witness_masks(
+        self,
+        individuals: Set[str],
+        facts: Set[Tuple[str, str, str]],
+        x: Union[Tensor, Dict[str, Tensor]],
+        edge_index: Union[Tensor, Dict[Any, Tensor]],
+        edge_type: Optional[Tensor] = None,
+    ) -> Tuple[Dict[Any, Tensor], Optional[Dict[Any, Tensor]]]:
+        r"""Returns the :obj:`[num_nodes, 1]` masks of the witness nodes per
+        node type and, if edge masks are requested, the masks of the witness
+        edges per edge type (with type :obj:`None` in homogeneous graphs).
+
+        Witness edges are the edges that represent the object property
+        assertions the concept follows (including inverse edges of these
+        assertions), and the edges whose reified individuals are witnesses.
+        """
+        if isinstance(x, Tensor):
+            node_masks: Dict[Any, Tensor] = {None: torch.zeros(x.size(0), 1)}
+        else:
+            node_masks = {
+                key: torch.zeros(value.size(0), 1)
+                for key, value in x.items()
+            }
+        for iri in individuals:
+            if iri in self._node_index:
+                node_type, i = self._node_index[iri]
+                if node_type in node_masks:
+                    node_masks[node_type][i] = 1.0
+
+        if self.explainer_config.edge_mask_type is None:
+            return node_masks, None
+
+        # Reified edges are matched by their source and target node, and
+        # edges of unknown type by the nodes of the assertion:
+        reified: Set[Tuple[str, str]] = set()
+        if any(iri not in self._node_index for iri in individuals):
+            endpoints = self._get_edge_endpoints()
+            reified = {endpoints[i] for i in individuals if i in endpoints}
+        pairs = {(a, b) for a, _, b in facts}
+
+        def edge_mask(
+            index: Tensor,
+            src: Optional[str],
+            dst: Optional[str],
+            relations: Optional[List[Tuple[str, bool]]],
+        ) -> Tensor:
+            src_iri = self._node_iris.get(src, [])
+            dst_iri = self._node_iris.get(dst, [])
+            row, col = index.detach().cpu().tolist()
+            if len(row) > 0 and (max(row) >= len(src_iri)
+                                 or max(col) >= len(dst_iri)):
+                return torch.zeros(len(row))
+            mask = torch.zeros(len(row))
+            for k, (i, j) in enumerate(zip(row, col)):
+                a, b = src_iri[i], dst_iri[j]
+                if (a, b) in reified:
+                    mask[k] = 1.0
+                elif relations is None:
+                    mask[k] = float((a, b) in pairs)
+                else:
+                    rel, forward = relations[k]
+                    fact = (a, rel, b) if forward else (b, rel, a)
+                    mask[k] = float(fact in facts)
+            return mask
+
+        if isinstance(edge_index, Tensor):
+            relations = self._get_relations(edge_type, edge_index.size(1))
+            return node_masks, {
+                None: edge_mask(edge_index, None, None, relations)
+            }
+
+        schema = self._kb_schema
+        edge_masks = {}
+        for key, value in edge_index.items():
+            src, rel, dst = key
+            forward = not (schema.inverse_edge_types and rel.startswith('rev_')
+                           and (dst, rel[4:], src) in edge_index)
+            iri = schema.relation_iri(rel if forward else rel[4:])
+            edge_masks[key] = edge_mask(value, src, dst,
+                                        [(iri, forward)] * value.size(1))
+        return node_masks, edge_masks
 
     def _get_edge_endpoints(self) -> Dict[str, Tuple[str, str]]:
         r"""Returns the source and target node of every reified edge (an

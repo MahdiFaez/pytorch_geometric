@@ -49,12 +49,14 @@ def get_schema() -> OWLSchema:
                      feature_names=['Red', 'Blue'])
 
 
-def get_explainer(algorithm, explanation_type='phenomenon', model=None):
+def get_explainer(algorithm, explanation_type='phenomenon', model=None,
+                  edge_mask_type=None):
     return Explainer(
         model=model or GCN(),
         algorithm=algorithm,
         explanation_type=explanation_type,
         node_mask_type='object',
+        edge_mask_type=edge_mask_type,
         model_config=dict(
             mode='multiclass_classification',
             task_level='node',
@@ -172,10 +174,6 @@ def test_ontolearn_explainer_supports():
     with pytest.raises(ValueError, match="not support the given explanation"):
         Explainer(GCN(), OntolearnExplainer(), explanation_type='model',
                   node_mask_type='attributes', model_config=model_config)
-    with pytest.raises(ValueError, match="not support the given explanation"):
-        Explainer(GCN(), OntolearnExplainer(), explanation_type='model',
-                  node_mask_type='object', edge_mask_type='object',
-                  model_config=model_config)
     with pytest.raises(ValueError, match="not support the given explanation"):
         Explainer(GCN(), OntolearnExplainer(), explanation_type='model',
                   node_mask_type='object',
@@ -528,7 +526,7 @@ def test_ontolearn_explainer_graph_witnesses():
         has_atom,
         OWLObjectIntersectionOf(
             [cls('N'), OWLObjectSomeValuesFrom(bond, cls('O'))]))
-    graphs = torch.arange(2)
+    graphs = algorithm._example_iri
 
     def witnesses(expression):
         individuals, _ = algorithm._get_witnesses(expression, graphs)
@@ -553,3 +551,161 @@ def test_ontolearn_explainer_graph_witnesses():
     inverse = OWLObjectSomeValuesFrom(
         has_atom, OWLObjectSomeValuesFrom(OWLObjectInverseOf(bond), cls('N')))
     assert 1 in witnesses(inverse) and 0 in witnesses(inverse)
+
+
+class FixedLearner:
+    # A concept learner that always returns the same class expression:
+    def __init__(self, expression):
+        self.expression = expression
+
+    def fit(self, problem):
+        return self
+
+    def best_hypotheses(self, n=1):
+        return [self.expression]
+
+
+def owl(name):
+    from owlapy.class_expression import OWLClass
+    from owlapy.iri import IRI
+    from owlapy.owl_property import OWLObjectProperty
+    if name[0].isupper():
+        return OWLClass(IRI.create(BASE + name))
+    return OWLObjectProperty(IRI.create(BASE + name))
+
+
+@withPackage('ontolearn', 'rdflib')
+def test_ontolearn_explainer_witnesses():
+    from owlapy.class_expression import OWLObjectSomeValuesFrom
+
+    # A directed path in which every third node is red. Class 1 holds the
+    # nodes whose successor is red, *i.e.*, `∃ next.Red`:
+    num_nodes = 12
+    red = torch.arange(num_nodes) % 3 == 0
+    x = torch.stack([red, ~red], dim=1).float()
+    edge_index = torch.stack([torch.arange(11), torch.arange(1, 12)])
+    y = torch.zeros(num_nodes, dtype=torch.long)
+    y[:-1] = red[1:].long()
+
+    concept = OWLObjectSomeValuesFrom(owl('next'), owl('Red'))
+    algorithm = OntolearnExplainer(FixedLearner(concept), schema=get_schema(),
+                                   target_class=1)
+    explainer = get_explainer(algorithm, model=ConstantModel(),
+                              edge_mask_type='object')
+
+    # The witness of node 2 is its red successor 3, connected by edge 2:
+    explanation = explainer(x, edge_index, target=y, index=2)
+    assert explanation.concept == '∃ next.Red'
+    assert explanation.node_mask.view(-1).tolist() == y.float().tolist()
+    assert explanation.witness_mask.size() == (num_nodes, 1)
+    assert explanation.witness_mask.view(-1).nonzero().view(-1).tolist() == [3]
+    assert explanation.edge_mask.nonzero().view(-1).tolist() == [2]
+    assert bool(explanation.concept_agreement.all())
+
+    # Without an index, the witnesses of all instances are returned:
+    explanation = explainer(x, edge_index, target=y)
+    witnesses = explanation.witness_mask.view(-1).nonzero().view(-1)
+    assert witnesses.tolist() == [3, 6, 9]
+    assert explanation.edge_mask.nonzero().view(-1).tolist() == [2, 5, 8]
+
+    # Nodes that are no instances have no witnesses, and disagreements with
+    # the target are reported:
+    target = y.clone()
+    target[0] = 1
+    explanation = explainer(x, edge_index, target=target, index=0)
+    assert int(explanation.witness_mask.sum()) == 0
+    assert explanation.concept_agreement.tolist() == [False] + [True] * 11
+
+    # Without edge masks:
+    explainer = get_explainer(algorithm, model=ConstantModel())
+    explanation = explainer(x, edge_index, target=y, index=2)
+    assert 'edge_mask' not in explanation
+    assert int(explanation.witness_mask.sum()) == 1
+
+
+@withPackage('ontolearn', 'rdflib')
+def test_ontolearn_explainer_witnesses_reified_edges():
+    from owlapy.class_expression import OWLObjectSomeValuesFrom
+    from owlapy.iri import IRI
+    from owlapy.owl_property import OWLObjectProperty
+
+    from torch_geometric.data.owl_data import PYG_HAS_OUTGOING_EDGE
+
+    # A ring in which edges from even to odd nodes are double bonds:
+    num_nodes = 12
+    row = torch.arange(num_nodes)
+    col = (row + 1) % num_nodes
+    edge_index = torch.cat([torch.stack([row, col]),
+                            torch.stack([col, row])], dim=1)
+    double = torch.cat([row % 2 == 0, torch.zeros(num_nodes, dtype=bool)])
+    edge_attr = torch.stack([~double, double], dim=1).float()
+    y = (row % 2 == 0).long()
+
+    schema = OWLSchema(base_iri=BASE, relation_names=['bond'],
+                       feature_names=['Atom'],
+                       edge_feature_names=['SingleBond', 'DoubleBond'])
+    outgoing = OWLObjectProperty(IRI.create(PYG_HAS_OUTGOING_EDGE))
+    concept = OWLObjectSomeValuesFrom(outgoing, owl('DoubleBond'))
+    algorithm = OntolearnExplainer(FixedLearner(concept), schema=schema)
+    explainer = get_explainer(algorithm, model=ConstantModel(),
+                              edge_mask_type='object')
+    explanation = explainer(torch.ones(num_nodes, 1), edge_index, target=y,
+                            index=4, edge_attr=edge_attr)
+
+    # The witness of node 4 is its (reified) double bond to node 5:
+    assert explanation.node_mask.view(-1).tolist() == y.float().tolist()
+    assert int(explanation.witness_mask.sum()) == 0  # An edge, not a node.
+    assert explanation.edge_mask.nonzero().view(-1).tolist() == [4]
+
+
+@withPackage('ontolearn', 'rdflib')
+def test_ontolearn_explainer_witnesses_hetero():
+    from owlapy.class_expression import OWLObjectSomeValuesFrom
+
+    from torch_geometric.explain import HeteroExplanation
+
+    data = get_hetero_data()
+    schema = OWLSchema(
+        base_iri=BASE, feature_names={
+            'author': ['Author'],
+            'paper': ['Theory', 'Systems'],
+        })
+    concept = OWLObjectSomeValuesFrom(owl('writes'), owl('Theory'))
+    algorithm = OntolearnExplainer(FixedLearner(concept), schema=schema,
+                                   node_type='author')
+    explainer = get_explainer(algorithm, model=HeteroConstantModel(),
+                              edge_mask_type='object')
+    explanation = explainer(data.x_dict, data.edge_index_dict,
+                            target=data['author'].y, index=2)
+
+    # The witness of author 2 is the theory paper 2 they write:
+    assert isinstance(explanation, HeteroExplanation)
+    edge_type = ('author', 'writes', 'paper')
+    assert int(explanation['author'].witness_mask.sum()) == 0
+    witnesses = explanation['paper'].witness_mask.view(-1).nonzero()
+    assert witnesses.view(-1).tolist() == [2]
+    assert explanation[edge_type].edge_mask.nonzero().view(-1).tolist() == [2]
+    assert bool(explanation['author'].concept_agreement.all())
+
+
+@withPackage('ontolearn', 'rdflib')
+def test_ontolearn_explainer_witness_edge_types():
+    from owlapy.class_expression import OWLObjectSomeValuesFrom
+
+    # Node 0 is related to the red node 1 via `next` and `likes`, with
+    # inverse edge types (`next` = 0, `next⁻` = 1, `likes` = 2):
+    x = torch.tensor([[0.0, 1.0], [1.0, 0.0]])
+    edge_index = torch.tensor([[0, 0, 1], [1, 1, 0]])
+    edge_type = torch.tensor([0, 2, 1])
+    schema = OWLSchema(base_iri=BASE, relation_names=['next', 'likes'],
+                       inverse_edge_types=True, feature_names=['Red', 'Blue'])
+    concept = OWLObjectSomeValuesFrom(owl('next'), owl('Red'))
+    algorithm = OntolearnExplainer(FixedLearner(concept), schema=schema)
+    explainer = get_explainer(algorithm, model=ConstantModel(),
+                              edge_mask_type='object')
+    explanation = explainer(x, edge_index, target=torch.tensor([1, 0]),
+                            index=0, edge_type=edge_type)
+
+    # Only the `next` assertion (and its inverse edge) is a witness edge:
+    assert explanation.witness_mask.view(-1).tolist() == [0.0, 1.0]
+    assert explanation.edge_mask.tolist() == [1.0, 0.0, 1.0]
